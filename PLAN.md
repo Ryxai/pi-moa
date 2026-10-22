@@ -87,9 +87,25 @@ Separately, a `before_provider_request` hook moves the cache marker off the advi
   - Rendering only ever appends, so advisor prompt caching works across steps.
 - **Trimming to the advisor's `contextWindow`:**
   - Budget is `window × 0.9 − maxTokens`, estimated at characters / 4.
-  - Always keep the `pin` items: `task` (first user message of the turn), `latestError`, `latestDiff`, plus the
-    last two steps.
+  - Always keep the `pin` items: `task` (the turn's user message: the last real user message, so steering
+    starts a new turn), `latestError`, `latestDiff`, plus the last two steps.
   - Drop the oldest middle steps behind `[… N earlier steps omitted …]`.
+  - *Built (step 5), deviations:* estimated at 3 characters per token; the reserve is `maxTokens` (8192 when
+    unset) plus the thinking budget, capped at half the window. The marker counts messages
+    (`[… N earlier messages omitted …]`), one per dropped run (a pin inside the dropped range splits it).
+    Cuts are chunked (30% of the budget) so the prefix stays stable for caching; it also changes when a
+    pin moves, and every step once the kept messages alone are over budget (largest blocks cut head and
+    tail). The last message is always kept; `task` falls back to the compaction summary. Native views are
+    not trimmed (also when `native` is forced on a different model).
+- *Native view as built (step 5):* the transcript is projected as pi projects the actor's request (forced
+  prompt, hidden declarations, `blockImages`). Anthropic invalidates cached messages when `tool_choice` or
+  thinking settings change, so `context.nativeToolChoice` (default `"omit"`) sends no tool choice, uses
+  only the reply's text, and retries a text-less reply once with `none`; native advisors use the actor's
+  thinking level unless set (the default preset no longer sets `thinking: "high"`) and the actor's session
+  id. Bedrock never gets `none` (pi drops `toolConfig` for it, which Bedrock rejects with tool history).
+  The `"omit"` retry happens only for tool-call replies (`stopReason: "toolUse"`) without text. Native
+  calls get pi's `thinkingBudgets` setting. Hidden declarations come from the run-start prompt options
+  (pi rebuilds them per step, agent-session.js:543-552, with no extension API for the live set).
 
 ## Roles
 
@@ -151,7 +167,7 @@ built-in `solo` preset is used; `/moa init` writes it out.
     "solo": {
       "actor": "current",
       "advisors": [
-        { "model": "current", "role": "advisor", "thinking": "high", "maxTokens": 2048 }
+        { "model": "current", "role": "advisor", "maxTokens": 2048 }
       ],
       "triggers": ["user_turn", "on_failure"],
       "onFailure": { "consecutiveErrors": 2, "repeatedCalls": 3 },
@@ -160,7 +176,8 @@ built-in `solo` preset is used; `/moa init` writes it out.
         "view": "auto",
         "projectInstructions": true,
         "toolResultChars": 4000,
-        "pin": ["task", "latestError", "latestDiff"]
+        "pin": ["task", "latestError", "latestDiff"],
+        "nativeToolChoice": "omit"
       },
       "framing": { "anonymize": true, "shuffle": true },
       "timeoutMs": 90000

@@ -56,7 +56,7 @@ describe("runAdvisors", () => {
 		};
 		await runAdvisors(
 			[
-				request("A", gpt, { thinking: "high", maxTokens: 512, sessionId: "moa0-s", onPayload: hook }),
+				request("A", gpt, { thinking: "high", thinkingBudgets: { high: 4000 }, maxTokens: 512, sessionId: "moa0-s", onPayload: hook }),
 				request("B", gpt, { thinking: "off" }),
 				request("C", gpt, { context: declared }),
 				request("D", gpt, { context: { ...context, tools: [read] } }),
@@ -64,7 +64,8 @@ describe("runAdvisors", () => {
 			],
 			{ complete, timeoutMs: 1000 },
 		);
-		expect(seen[0]).toMatchObject({ reasoning: "high", maxTokens: 512, sessionId: "moa0-s", onPayload: hook });
+		expect(seen[0]).toMatchObject({ reasoning: "high", thinkingBudgets: { high: 4000 }, maxTokens: 512, sessionId: "moa0-s", onPayload: hook });
+		expect(seen[1]).not.toHaveProperty("thinkingBudgets");
 		expect(seen[0]?.signal).toBeInstanceOf(AbortSignal);
 		expect(seen[0]).not.toHaveProperty("toolChoice");
 		expect(seen[1]).not.toHaveProperty("reasoning");
@@ -74,6 +75,113 @@ describe("runAdvisors", () => {
 		expect(seen[2]).toMatchObject({ toolChoice: "none" });
 		expect(seen[3]).toMatchObject({ toolChoice: "none" });
 		expect(seen[4]).not.toHaveProperty("toolChoice");
+	});
+
+	it("leaves toolChoice unset on Bedrock, which rejects tool history without toolConfig", async () => {
+		const seen: SimpleStreamOptions[] = [];
+		const complete: CompleteFn<ModelLike> = async (_m, _c, options) => {
+			seen.push(options);
+			return reply("ok");
+		};
+		const read = { name: "read", description: "", parameters: {} as never };
+		const bedrock: ModelLike = { provider: "amazon-bedrock", id: "claude", api: "bedrock-converse-stream" };
+		await runAdvisors([request("A", bedrock, { context: { messages: [], tools: [read] } })], { complete, timeoutMs: 1000 });
+		expect(seen[0]).not.toHaveProperty("toolChoice");
+	});
+
+	describe('toolChoice "omit"', () => {
+		const read = { name: "read", description: "", parameters: {} as never };
+		const native = (model = gpt): AdvisorRequest<ModelLike> => request("A", model, { context: { messages: [], tools: [read] }, toolChoice: "omit" });
+		const toolOnly = () => assistant([{ type: "toolCall", id: "t1", name: "read", arguments: {} }], { usage: usage(0.01), stopReason: "toolUse" });
+
+		it("sends no toolChoice and keeps a reply with text", async () => {
+			const seen: SimpleStreamOptions[] = [];
+			const complete: CompleteFn<ModelLike> = async (_m, _c, options) => {
+				seen.push(options);
+				return assistant([text("Advice."), { type: "toolCall", id: "t1", name: "read", arguments: {} }]);
+			};
+			const [result] = await runAdvisors([native()], { complete, timeoutMs: 1000 });
+			expect(seen).toHaveLength(1);
+			expect(seen[0]).not.toHaveProperty("toolChoice");
+			expect(result).toMatchObject({ ok: true, text: "Advice." });
+			expect(result).not.toHaveProperty("retried");
+		});
+
+		it("retries a reply without text once with toolChoice none, summing usage", async () => {
+			const seen: SimpleStreamOptions[] = [];
+			const replies = [toolOnly(), reply("Now in prose.")];
+			const complete: CompleteFn<ModelLike> = async (_m, _c, options) => {
+				seen.push(options);
+				return replies.shift()!;
+			};
+			const [result] = await runAdvisors([native()], { complete, timeoutMs: 1000 });
+			expect(seen.map((o) => o.toolChoice)).toEqual([undefined, "none"]);
+			expect(result).toMatchObject({ ok: true, text: "Now in prose.", retried: true, costUsd: 0.03 });
+			expect(result?.usage?.input).toBe(20);
+		});
+
+		it("records the retry when the second reply is empty too, and never retries more", async () => {
+			let calls = 0;
+			const [result] = await runAdvisors([native()], {
+				complete: async () => {
+					calls++;
+					return toolOnly();
+				},
+				timeoutMs: 1000,
+			});
+			expect(calls).toBe(2);
+			expect(result).toMatchObject({ ok: false, error: "empty response", retried: true });
+		});
+
+		it("does not retry empty replies that did not call tools (length, thinking only)", async () => {
+			let calls = 0;
+			const replies = [assistant([{ type: "thinking", thinking: "hmm" }], { stopReason: "length" }), assistant([], { stopReason: "stop" })];
+			const complete: CompleteFn<ModelLike> = async () => {
+				calls++;
+				return replies.shift()!;
+			};
+			const results = await runAdvisors([native(), native()], { complete, timeoutMs: 1000 });
+			expect(calls).toBe(2);
+			expect(results.every((r) => r.error === "empty response" && r.retried === undefined)).toBe(true);
+		});
+
+		it("does not retry errors, Bedrock, or calls without tools", async () => {
+			let calls = 0;
+			const complete: CompleteFn<ModelLike> = async (model) => {
+				calls++;
+				return model.id === "err" ? reply("", { stopReason: "error", errorMessage: "boom" }) : toolOnly();
+			};
+			const bedrock: ModelLike = { provider: "amazon-bedrock", id: "claude", api: "bedrock-converse-stream" };
+			await runAdvisors(
+				[native({ provider: "x", id: "err" }), native(bedrock), request("C", gpt, { toolChoice: "omit" })],
+				{ complete, timeoutMs: 1000 },
+			);
+			expect(calls).toBe(3);
+		});
+
+		it("shares the timeout with the retry", async () => {
+			vi.useFakeTimers();
+			const replies: Promise<AssistantMessage>[] = [Promise.resolve(toolOnly()), new Promise(() => {})];
+			const pending = runAdvisors([native()], { complete: () => replies.shift()!, timeoutMs: 5000 });
+			await vi.advanceTimersByTimeAsync(5000);
+			expect((await pending)[0]).toMatchObject({ ok: false, error: "timeout after 5s", retried: true });
+		});
+	});
+
+	it("uses only the text of a response that still calls tools", async () => {
+		const complete: CompleteFn<ModelLike> = async () =>
+			assistant([
+				{ type: "thinking", thinking: "maybe run it" },
+				text("Run the tests before editing."),
+				{ type: "toolCall", id: "t1", name: "bash", arguments: { command: "npm test" } },
+			]);
+		const [result] = await runAdvisors([request("A")], { complete, timeoutMs: 1000 });
+		expect(result).toMatchObject({ ok: true, text: "Run the tests before editing." });
+		const [onlyCall] = await runAdvisors([request("A")], {
+			complete: async () => assistant([{ type: "toolCall", id: "t1", name: "bash", arguments: {} }]),
+			timeoutMs: 1000,
+		});
+		expect(onlyCall).toMatchObject({ ok: false, error: "empty response" });
 	});
 
 	it("treats error and aborted stop reasons as failures", async () => {

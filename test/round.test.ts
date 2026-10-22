@@ -3,8 +3,8 @@ import { describe, expect, it } from "vitest";
 import type { CompleteFn } from "../src/advisors.ts";
 import type { ModelLike, ModelLookup } from "../src/config-resolve.ts";
 import { DEFAULT_CONFIG, DEFAULT_PRESET, type MoaConfig } from "../src/config.ts";
-import { BASE_RULES, ROLE_PROMPTS } from "../src/roles.ts";
-import { appendAdvice, runRound, type MoaRecord, type RoundDeps, type RoundInput } from "../src/round.ts";
+import { BASE_RULES, NATIVE_BASE_RULES, ROLE_PROMPTS } from "../src/roles.ts";
+import { advisorView, appendAdvice, runRound, type MoaRecord, type RoundDeps, type RoundInput } from "../src/round.ts";
 import { ADVICE_REQUEST } from "../src/view.ts";
 import { assistant, system, text, toolResult, user, usage } from "./fixtures.ts";
 
@@ -78,9 +78,16 @@ describe("runRound", () => {
 		]);
 
 		expect(contexts.get("gpt")?.systemPrompt).toBe(`${BASE_RULES}\n\nPlan from file.`);
-		expect(contexts.get("sonnet")?.systemPrompt).toContain(ROLE_PROMPTS.critic);
-		expect(contexts.get("sonnet")?.systemPrompt).toContain("Stance: skeptical");
 		expect(contexts.get("gpt")?.messages.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+		// "current" is the actor: native view, instructions in the trailing user message.
+		const native = contexts.get("sonnet")!;
+		expect(native.systemPrompt).toBeUndefined();
+		expect(native.messages.map((m) => m.role)).toEqual(["system", "user", "assistant", "toolResult", "user"]);
+		const instruction = (native.messages.at(-1)!.content as { text: string }[])[0]!.text;
+		expect(instruction).toContain(NATIVE_BASE_RULES);
+		expect(instruction).toContain(ROLE_PROMPTS.critic);
+		expect(instruction).toContain("Stance: skeptical");
+		expect(instruction.endsWith(ADVICE_REQUEST)).toBe(true);
 
 		expect(records).toHaveLength(1);
 		expect(records[0]).toMatchObject({ preset: "council", reason: "user_turn", turn: "10:abc", step: 1 });
@@ -131,8 +138,9 @@ describe("runRound", () => {
 		);
 		input.config = { ...council, presets: { ...council.presets, council: { ...council.presets.council!, framing: { anonymize: true, shuffle: true } } } };
 		await runRound(input, { ...deps, rng: () => 0 });
+		// Text view (gpt): per-slot id; native view (sonnet, the actor): the actor's own.
 		expect(seen.get("gpt")?.sessionId).toBe("moa0-sess-1");
-		expect(seen.get("sonnet")?.sessionId).toBe("moa1-sess-1");
+		expect(seen.get("sonnet")?.sessionId).toBe("sess-1");
 		const hook = seen.get("gpt")?.onPayload;
 		expect(hook).toBeTypeOf("function");
 		const payload = {
@@ -172,6 +180,71 @@ describe("runRound", () => {
 	it("skips an unknown preset", async () => {
 		const { input, deps } = setup(async () => assistant([text("ok")]), { presetName: "nope" });
 		expect(await runRound(input, deps)).toBeUndefined();
+	});
+});
+
+describe("advisorView", () => {
+	const preset = (context: Partial<typeof DEFAULT_PRESET.context>) => ({ ...DEFAULT_PRESET, context: { ...DEFAULT_PRESET.context, ...context } });
+	const input = (extra: Partial<RoundInput<ModelLike>> = {}) => ({ actor: sonnet, config: council, ...extra });
+	const slot = (model: ModelLike, extra = {}) => ({ model, config: { model: "x", role: "advisor", ...extra } });
+
+	it.each([
+		["auto", sonnet, "native"],
+		["auto", gpt, "text"],
+		["text", sonnet, "text"],
+		["native", gpt, "native"],
+	] as const)("view %s with advisor %o is %s", (view, model, expected) => {
+		expect(advisorView(messages, slot(model), { input: input(), preset: preset({ view }) }).view).toBe(expected);
+	});
+
+	it("uses the text view when there is no actor", () => {
+		expect(advisorView(messages, slot(sonnet), { input: input({ actor: undefined }), preset: preset({}) }).view).toBe("text");
+	});
+
+	it("appends project instructions to the text view's system prompt only when enabled", () => {
+		const on = advisorView(messages, slot(gpt), { input: input({ projectInstructions: "## AGENTS.md\n\nUse tabs." }), preset: preset({}) });
+		expect(on.context.systemPrompt).toBe(`${BASE_RULES}\n\n${ROLE_PROMPTS.advisor}\n\n# Project instructions\n\n## AGENTS.md\n\nUse tabs.`);
+		const off = advisorView(messages, slot(gpt), {
+			input: input({ projectInstructions: "## AGENTS.md\n\nUse tabs." }),
+			preset: preset({ projectInstructions: false }),
+		});
+		expect(off.context.systemPrompt).not.toContain("Project instructions");
+		// The native view has them in the actor's own system prompt already.
+		const native = advisorView(messages, slot(sonnet), { input: input({ projectInstructions: "x" }), preset: preset({}) });
+		expect(JSON.stringify(native.context)).not.toContain("Project instructions");
+	});
+
+	it("trims the text view to the advisor's context window, and not without one", () => {
+		const long = [...messages, ...Array.from({ length: 40 }, (_, i) => [assistant([text(`step ${i} ${"x".repeat(2000)}`)]), user(`more ${i}`, 20 + i)]).flat()];
+		const small = { ...gpt, contextWindow: 20_000 };
+		const trimmed = advisorView(long, slot(small, { maxTokens: 1000 }), { input: input(), preset: preset({}) });
+		expect(JSON.stringify(trimmed.context)).toContain("earlier messages omitted");
+		const texts = trimmed.context.messages.flatMap((m) => (m.content as { text: string }[]).map((b) => b.text));
+		const chars = trimmed.context.systemPrompt!.length + texts.join("").length;
+		expect(chars).toBeLessThanOrEqual((20_000 * 0.9 - 1000) * 4);
+		const whole = advisorView(long, slot(gpt), { input: input(), preset: preset({}) });
+		expect(JSON.stringify(whole.context)).not.toContain("omitted");
+	});
+
+	it("native: actor's thinking unless the slot sets one, actor's session id, nativeToolChoice, pi's projection", () => {
+		const extra = { actorThinking: "medium" as const, thinkingBudgets: { medium: 5000 }, sessionId: "s", projection: { forceSystemPrompt: "FORCED" } };
+		const native = advisorView(messages, slot(sonnet), { input: input(extra), preset: preset({}) });
+		expect(native).toMatchObject({ thinking: "medium", thinkingBudgets: { medium: 5000 }, sessionId: "s", toolChoice: "omit" });
+		expect(native.context.messages[0]).toMatchObject({ role: "system", content: "FORCED" });
+		const own = advisorView(messages, slot(sonnet, { thinking: "low" }), { input: input(extra), preset: preset({ nativeToolChoice: "none" }) });
+		expect(own).toMatchObject({ thinking: "low", toolChoice: "none" });
+		const text = advisorView(messages, { ...slot(gpt), slot: 2 }, { input: input(extra), preset: preset({}) });
+		expect(text.thinking).toBeUndefined();
+		expect(text.sessionId).toBe("moa2-s");
+		expect(text.toolChoice).toBeUndefined();
+		expect(text.thinkingBudgets).toBeUndefined();
+	});
+
+	it("gives the payload hook the right tail texts per view", () => {
+		const native = advisorView(messages, slot(sonnet), { input: input(), preset: preset({}) });
+		const instruction = (native.context.messages.at(-1)!.content as { text: string }[])[0]!.text;
+		expect(native.tailTexts).toEqual([instruction]);
+		expect(advisorView(messages, slot(gpt), { input: input(), preset: preset({}) }).tailTexts).toContain(ADVICE_REQUEST);
 	});
 });
 

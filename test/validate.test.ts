@@ -20,6 +20,11 @@ describe("validateConfig", () => {
 		expectIssue({ presets: { solo: { advisors: [] } } }, "presets.solo.advisors", "at least one");
 	});
 
+	it("checks context.nativeToolChoice", () => {
+		expect(messages({ presets: { solo: { context: { nativeToolChoice: "none" } } } })).toEqual([]);
+		expectIssue({ presets: { solo: { context: { nativeToolChoice: "auto" } } } }, "presets.solo.context.nativeToolChoice", "must be one of");
+	});
+
 	it("rejects moa/* models in advisor and actor slots", () => {
 		expectIssue({ presets: { solo: { advisors: [advisor("moa/solo")] } } }, "presets.solo.advisors[0].model", "moa/*");
 		expectIssue({ presets: { solo: { actor: "moa/council" } } }, "presets.solo.actor", "moa/*");

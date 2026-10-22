@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Context } from "@earendil-works/pi-ai";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import moa from "../src/index.ts";
@@ -23,8 +24,9 @@ interface Harness {
 	emit(event: string, payload?: unknown): Promise<unknown>;
 	lastNote(): Note | undefined;
 	auth: { ok: boolean };
-	llm: { reply: (model: { id: string }) => Promise<unknown>; options: unknown[] };
+	llm: { reply: (model: { id: string }) => Promise<unknown>; options: unknown[]; contexts: Context[] };
 	working: (string | undefined)[];
+	piState: { blockImages: boolean; thinking: string };
 }
 
 const model = { provider: "anthropic", id: "sonnet" };
@@ -40,8 +42,10 @@ async function setup(): Promise<Harness> {
 	const llm = {
 		reply: async (_model: { id: string }): Promise<unknown> => assistant([text("Check the failing test first.")]),
 		options: [] as unknown[],
+		contexts: [] as Context[],
 	};
 	const working: (string | undefined)[] = [];
+	const piState = { blockImages: false, thinking: "medium" };
 	let command: { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> } | undefined;
 	const pi = {
 		on: (event: string, handler: Handler) => handlers.set(event, handler),
@@ -49,6 +53,8 @@ async function setup(): Promise<Harness> {
 			command = options;
 		},
 		appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", customType, data }),
+		getSettings: () => ({ images: { blockImages: piState.blockImages }, thinkingBudgets: { low: 3000 } }),
+		getThinkingLevel: () => piState.thinking,
 	};
 	moa(pi as unknown as ExtensionAPI);
 	const ctx = {
@@ -59,8 +65,9 @@ async function setup(): Promise<Harness> {
 		modelRegistry: {
 			find: (provider: string, id: string) => (provider === model.provider && id === model.id ? model : undefined),
 			hasConfiguredAuth: () => auth.ok,
-			streamSimple: (m: { id: string }, _context: unknown, options: unknown) => {
+			streamSimple: (m: { id: string }, context: Context, options: unknown) => {
 				llm.options.push(options);
+				llm.contexts.push(context);
 				return { result: () => llm.reply(m) };
 			},
 		},
@@ -84,6 +91,7 @@ async function setup(): Promise<Harness> {
 		auth,
 		llm,
 		working,
+		piState,
 	};
 }
 
@@ -351,12 +359,16 @@ describe("before_provider_request (cache marker)", () => {
 		expect(await request(payloadFor(again))).toBeUndefined();
 	});
 
-	it("gives advisor calls a per-slot session id and the payload hook", async () => {
+	it("gives native advisors the actor's session id, text advisors a per-slot one, and the payload hook", async () => {
 		await h.run("on");
 		await h.emit("context_with_system", event());
-		const options = h.llm.options.at(-1) as { sessionId?: string; onPayload?: unknown };
-		expect(options.sessionId).toBe("moa0-session-1");
-		expect(options.onPayload).toBeTypeOf("function");
+		const native = h.llm.options.at(-1) as { sessionId?: string; onPayload?: unknown };
+		expect(native.sessionId).toBe("session-1");
+		expect(native.onPayload).toBeTypeOf("function");
+		await writeGlobal(h, { presets: { solo: { context: { view: "text" } } } });
+		await h.run("reload");
+		await h.emit("context_with_system", event());
+		expect((h.llm.options.at(-1) as { sessionId?: string }).sessionId).toBe("moa0-session-1");
 	});
 });
 
@@ -542,5 +554,91 @@ describe("triggers and the advice cache", () => {
 		const out = (await h.emit("before_provider_request", { type: "before_provider_request", payload })) as typeof payload;
 		expect(out.messages[1]!.content[0]).not.toHaveProperty("cache_control");
 		expect(out.messages[0]!.content[0]).toHaveProperty("cache_control");
+	});
+});
+
+describe("advisor views", () => {
+	const messages = (prompt = "Fix the test", ts = 100) => [system("You are pi."), user(prompt, ts)];
+	const step = (m: unknown[]) => h.emit("context_with_system", { type: "context_with_system", messages: m });
+	const agentStart = (contextFiles: { path: string; content: string }[]) => {
+		const systemPromptOptions = { contextFiles };
+		return { event: { type: "before_agent_start", systemPromptOptions }, systemPromptOptions };
+	};
+
+	it("gives a \"current\" advisor the actor's own request (native view) by default", async () => {
+		await h.run("on");
+		await step(messages());
+		const context = h.llm.contexts.at(-1)!;
+		expect(context.systemPrompt).toBeUndefined();
+		expect(context.messages[0]).toEqual(system("You are pi."));
+		expect(context.messages.map((m) => m.role)).toEqual(["system", "user", "user"]);
+	});
+
+	it("projects the native view as pi does and uses the actor's thinking level", async () => {
+		await h.run("on");
+		h.piState.blockImages = true;
+		h.piState.thinking = "low";
+		await h.emit("before_agent_start", { type: "before_agent_start", systemPromptOptions: { contextFiles: [], forceSystemPrompt: "FORCED" } });
+		const image = { type: "image" as const, data: "AAAA", mimeType: "image/png" };
+		await step([system("You are pi."), { role: "user", content: [text("see"), image], timestamp: 100 }]);
+		const context = h.llm.contexts.at(-1)!;
+		expect(context.messages[0]).toMatchObject({ role: "system", content: "FORCED" });
+		expect(context.messages[1]!.content).toEqual([text("see"), text("Image reading is disabled.")]);
+		expect(h.llm.options.at(-1)).toMatchObject({ reasoning: "low", thinkingBudgets: { low: 3000 } });
+		expect(h.llm.options.at(-1)).not.toHaveProperty("toolChoice");
+	});
+
+	it("adds the run's project context files to text views, read at request time and stable across steps", async () => {
+		await writeGlobal(h, { presets: { solo: { context: { view: "text" } } } });
+		await h.run("reload");
+		await h.run("on");
+		const start = agentStart([{ path: "/repo/AGENTS.md", content: "Use tabs." }]);
+		await h.emit("before_agent_start", start.event);
+		// A later before_agent_start handler adds a file; pi builds the run's prompt from the same object.
+		start.systemPromptOptions.contextFiles.push({ path: "/repo/CLAUDE.md", content: "Run npm test." });
+		await step(messages());
+		const prompt = h.llm.contexts.at(-1)!.systemPrompt!;
+		expect(prompt).toContain("# Project instructions\n\n## /repo/AGENTS.md\n\nUse tabs.\n\n## /repo/CLAUDE.md\n\nRun npm test.");
+		await step(messages("Next task", 200));
+		expect(h.llm.contexts.at(-1)!.systemPrompt).toBe(prompt);
+		await h.emit("session_start");
+		await step(messages("Third task", 300));
+		expect(h.llm.contexts.at(-1)!.systemPrompt).not.toContain("Project instructions");
+	});
+
+	it("leaves project instructions out when disabled", async () => {
+		await writeGlobal(h, { presets: { solo: { context: { view: "text", projectInstructions: false } } } });
+		await h.run("reload");
+		await h.run("on");
+		await h.emit("before_agent_start", agentStart([{ path: "/repo/AGENTS.md", content: "Use tabs." }]).event);
+		await step(messages());
+		expect(h.llm.contexts.at(-1)!.systemPrompt).not.toContain("Use tabs.");
+	});
+});
+
+describe("toggling clears the turn's advice", () => {
+	const transcript = (results: number) => [
+		system("You are pi."),
+		user("Fix the test", 100),
+		...Array.from({ length: results }, (_, i) => [
+			assistant([{ type: "toolCall" as const, id: `c${i}`, name: "bash", arguments: { command: `step ${i}` } }], { stopReason: "toolUse" }),
+			{ ...toolResult("bash", "ok"), toolCallId: `c${i}` },
+		]).flat(),
+	];
+	const advice = async (results: number) =>
+		((await h.emit("context_with_system", { type: "context_with_system", messages: transcript(results) })) as { messages: { content: { text: string }[] }[] } | undefined)
+			?.messages.at(-1)?.content[0]?.text;
+
+	it.each([
+		["off and on", ["off", "on"]],
+		["a preset switch", ["on other"]],
+	])("after %s, earlier advice is not reused", async (_name, commands) => {
+		await writeGlobal(h, { presets: { other: {} } });
+		await h.run("reload");
+		await h.run("on");
+		expect(await advice(0)).toContain("Check the failing test first.");
+		expect(await advice(1)).toContain("Check the failing test first.");
+		for (const command of commands) await h.run(command);
+		expect(await advice(2)).toBeUndefined();
 	});
 });

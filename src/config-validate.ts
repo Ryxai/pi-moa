@@ -5,6 +5,7 @@ import {
 	CONTEXT_VIEWS,
 	isPlainObject,
 	NAMED_TRIGGERS,
+	NATIVE_TOOL_CHOICES,
 	PIN_ITEMS,
 	type PlainObject,
 	STANCES,
@@ -178,6 +179,7 @@ function validateContext(context: PlainObject, path: string, report: Report): vo
 	checkInt(context.toolResultChars, `${path}.toolResultChars`, 0, 1_000_000, report);
 	if (!Array.isArray(context.pin)) report(`${path}.pin`, "must be an array");
 	else context.pin.forEach((item, i) => checkEnum(item, PIN_ITEMS, `${path}.pin[${i}]`, report));
+	checkEnum(context.nativeToolChoice, NATIVE_TOOL_CHOICES, `${path}.nativeToolChoice`, report);
 }
 
 function validateBudget(budget: unknown, report: Report): void {

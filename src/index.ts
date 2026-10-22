@@ -7,9 +7,13 @@ import { CONFIG_FILE, loadConfig, writeDefaultConfig, type LoadedConfig } from "
 import { resolvePreset } from "./config-resolve.ts";
 import { formatIssues, getPreset, issuesFor } from "./config.ts";
 import { createDebugLog, debugLogPath } from "./debug.ts";
+import { projectInstructions, type PromptOptionsLike } from "./roles.ts";
 import { appendAdvice, runRound } from "./round.ts";
 import { OFF, reconstructState, STATE_ENTRY, type MoaState } from "./state.ts";
+import type { ThinkingBudgets } from "@earendil-works/pi-ai";
+import type { ThinkingLevel } from "./schema.ts";
 import { analyzeTurn } from "./triggers.ts";
+import type { RequestProjection } from "./view.ts";
 
 /** How many recent advice texts the cache-marker hook recognises. */
 const TRACKED_ADVICE = 3;
@@ -32,6 +36,12 @@ export default function moa(pi: ExtensionAPI): void {
 	let injected: string[] = [];
 	/** Advice for the current turn, reused on steps where no trigger fires and on retries. */
 	let turnCache: TurnCache | undefined;
+	/**
+	 * The current run's prompt options from `before_agent_start` (the object pi then builds the
+	 * run's system prompt from, so mutations by later handlers are seen); source of the project
+	 * context files for text views.
+	 */
+	let promptOptions: PromptOptionsLike | undefined;
 
 	async function reload(ctx: ExtensionContext): Promise<LoadedConfig> {
 		loaded = await loadConfig({
@@ -56,6 +66,7 @@ export default function moa(pi: ExtensionAPI): void {
 	}
 
 	function setState(next: MoaState, ctx: ExtensionContext): void {
+		if (next.enabled !== state.enabled || next.preset !== state.preset) turnCache = undefined;
 		state = next;
 		if (next.enabled !== persisted.enabled || next.preset !== persisted.preset) {
 			pi.appendEntry(STATE_ENTRY, next);
@@ -93,6 +104,7 @@ export default function moa(pi: ExtensionAPI): void {
 		contextCalls = 0;
 		injected = [];
 		turnCache = undefined;
+		promptOptions = undefined;
 		const config = await reload(ctx);
 		for (const note of config.notes) notify(ctx, `MoA: ${note}`, "warning");
 		persisted = reconstructState(ctx.sessionManager.getBranch());
@@ -109,6 +121,33 @@ export default function moa(pi: ExtensionAPI): void {
 
 	pi.on("session_start", (_event, ctx) => restore(ctx));
 	pi.on("session_tree", (_event, ctx) => restore(ctx));
+
+	/** The settings pi applies to the actor's requests that native views mirror. */
+	function actorSettings(): { projection: RequestProjection; thinkingBudgets?: ThinkingBudgets } {
+		let settings: Partial<ReturnType<ExtensionAPI["getSettings"]>> = {};
+		try {
+			settings = pi.getSettings();
+		} catch {
+			// Settings unavailable: pi's defaults (images allowed, default budgets).
+		}
+		return {
+			// `hiddenTools` is the run-start set; pi may change it on later steps of the run.
+			projection: { forceSystemPrompt: promptOptions?.forceSystemPrompt, hiddenTools: promptOptions?.hiddenTools, blockImages: settings.images?.blockImages ?? false },
+			thinkingBudgets: settings.thinkingBudgets,
+		};
+	}
+
+	function actorThinking(): ThinkingLevel | undefined {
+		try {
+			return pi.getThinkingLevel();
+		} catch {
+			return undefined;
+		}
+	}
+
+	pi.on("before_agent_start", (event) => {
+		promptOptions = event.systemPromptOptions;
+	});
 
 	pi.on("context_with_system", async (event, ctx) => {
 		contextCalls++;
@@ -139,6 +178,9 @@ export default function moa(pi: ExtensionAPI): void {
 						actor: ctx.model,
 						signal: ctx.signal,
 						sessionId: sessionIdOf(ctx),
+						projectInstructions: projectInstructions(promptOptions),
+						...actorSettings(),
+						actorThinking: actorThinking(),
 						reason: decision.reason,
 						turn: analysis.turnKey,
 						step: analysis.step,

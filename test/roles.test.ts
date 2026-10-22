@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { assemblePrompt, BASE_RULES, ROLE_PROMPTS, STANCE_LINES } from "../src/roles.ts";
+import {
+	assemblePrompt,
+	BASE_RULES,
+	NATIVE_BASE_RULES,
+	PROJECT_INSTRUCTIONS_CHARS,
+	projectInstructions,
+	ROLE_PROMPTS,
+	STANCE_LINES,
+	withProjectInstructions,
+} from "../src/roles.ts";
 
 describe("assemblePrompt", () => {
 	it("defaults to base rules plus the advisor role", () => {
@@ -46,5 +55,47 @@ describe("assemblePrompt", () => {
 		expect(BASE_RULES).toMatch(/Never claim or imply/);
 		expect(BASE_RULES).toMatch(/verify X/);
 		expect(BASE_RULES).toMatch(/400 words/);
+	});
+});
+
+describe("native base rules", () => {
+	it("replace the text-view rules and drop the ⟨tool⟩ notation", () => {
+		expect(assemblePrompt("critic", {}, {}, undefined, NATIVE_BASE_RULES)).toBe(`${NATIVE_BASE_RULES}\n\n${ROLE_PROMPTS.critic}`);
+		expect(NATIVE_BASE_RULES).not.toContain("⟨");
+		expect(BASE_RULES).toContain("⟨tool");
+	});
+
+	it("are dropped by replaceBase too", () => {
+		expect(assemblePrompt("x", {}, { x: { prompt: "Only me.", replaceBase: true } }, undefined, NATIVE_BASE_RULES)).toBe("Only me.");
+	});
+});
+
+describe("projectInstructions", () => {
+	const files = [
+		{ path: "/repo/AGENTS.md", content: "Use tabs.\n" },
+		{ path: "/repo/pkg/AGENTS.md", content: "  " },
+		{ path: "/repo/CLAUDE.md", content: "Run npm test." },
+	];
+
+	it("renders each non-empty context file under its path", () => {
+		expect(projectInstructions({ contextFiles: files })).toBe("## /repo/AGENTS.md\n\nUse tabs.\n\n## /repo/CLAUDE.md\n\nRun npm test.");
+	});
+
+	it("is undefined without files, options, or when the prompt is forced", () => {
+		expect(projectInstructions(undefined)).toBeUndefined();
+		expect(projectInstructions({ contextFiles: [] })).toBeUndefined();
+		expect(projectInstructions({ contextFiles: files, forceSystemPrompt: "custom" })).toBeUndefined();
+	});
+
+	it("caps the size, keeping head and tail", () => {
+		const text = projectInstructions({ contextFiles: [{ path: "A.md", content: `START${"x".repeat(20_000)}END` }] })!;
+		expect(text.length).toBeLessThan(PROJECT_INSTRUCTIONS_CHARS + 50);
+		expect(text.startsWith("## A.md\n\nSTART")).toBe(true);
+		expect(text.endsWith("END")).toBe(true);
+	});
+
+	it("appends under a heading only when present", () => {
+		expect(withProjectInstructions("rules", "## A.md\n\nx")).toBe("rules\n\n# Project instructions\n\n## A.md\n\nx");
+		expect(withProjectInstructions("rules", undefined)).toBe("rules");
 	});
 });

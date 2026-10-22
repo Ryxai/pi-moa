@@ -1,5 +1,19 @@
-import type { AssistantMessage, Context, ImageContent, Message, TextContent, ToolCall, UserMessage } from "@earendil-works/pi-ai";
+import {
+	getCurrentSystemMessage,
+	type AssistantMessage,
+	type Context,
+	type ImageContent,
+	type Message,
+	type SystemMessage,
+	type TextContent,
+	type ToolCall,
+	type UserMessage,
+} from "@earendil-works/pi-ai";
 import { convertToLlm, type ContextWithSystemEvent } from "@earendil-works/pi-coding-agent";
+import type { ModelLike } from "./config-resolve.ts";
+import type { ContextView, PinItem } from "./schema.ts";
+import { head, truncateMiddle } from "./text.ts";
+import { trimEntries } from "./trim.ts";
 
 export type AgentMessage = ContextWithSystemEvent["messages"][number];
 
@@ -19,6 +33,96 @@ export const ADVICE_REQUEST_BLOCKS: readonly string[] = [ADVICE_REQUEST, `${BLOC
 
 const AGENT_FIRST = "(The transcript starts with the agent.)";
 
+/** `auto` is native when the advisor is the actor's model (same provider and id), else text. */
+export function selectView(view: ContextView, advisor: ModelLike, actor: ModelLike | undefined): "native" | "text" {
+	if (view !== "auto") return view;
+	return actor && advisor.provider === actor.provider && advisor.id === actor.id ? "native" : "text";
+}
+
+/** The native view's trailing user message: advisor instructions, then the advice request. */
+export function nativeInstruction(prompt: string): string {
+	return `${prompt}\n\n${ADVICE_REQUEST}`;
+}
+
+/**
+ * What pi does to the request after the `context_with_system` handlers, from the run's prompt
+ * options and settings (pi-coding-agent 1.4.0).
+ */
+export interface RequestProjection {
+	/** `_installHiddenDeclarationsProjection`: declarations requests leave out. */
+	hiddenTools?: readonly string[];
+	/** `_installAgentForcedPromptProjection`: a `before_agent_start` handler replaced the prompt. */
+	forceSystemPrompt?: string;
+	/** `images.blockImages`: sdk.js's `convertToLlm` wrapper replaces images with a note. */
+	blockImages?: boolean;
+}
+
+/**
+ * The actor's own request (system message with prompt and tools, transcript, thinking), projected
+ * as pi projects it, followed by `instruction` as one trailing user message, so the provider
+ * prefix matches the actor's.
+ */
+export function buildNativeView(messages: readonly AgentMessage[], instruction: string, projection: RequestProjection = {}): Context {
+	let transcript: Message[] = convertToLlm([...messages]);
+	if (projection.hiddenTools?.length) transcript = hideDeclarations(transcript, new Set(projection.hiddenTools));
+	if (projection.forceSystemPrompt !== undefined) transcript = forcePrompt(transcript, projection.forceSystemPrompt);
+	if (projection.blockImages) transcript = transcript.map(blockImages);
+	const request: UserMessage = { role: "user", content: [{ type: "text", text: instruction }], timestamp: transcript.at(-1)?.timestamp ?? 0 };
+	return { messages: [...transcript, request] };
+}
+
+/** Mirrors agent-session.js `_installHiddenDeclarationsProjection`. */
+function hideDeclarations(messages: Message[], hidden: ReadonlySet<string>): Message[] {
+	return messages.map((message) => {
+		if (message.role !== "system" || (!message.toolsAdded && !message.toolsRemoved)) return message;
+		const { toolsAdded, toolsRemoved, ...rest } = message;
+		const added = toolsAdded?.filter((tool) => !hidden.has(tool.name)) ?? [];
+		const removed = toolsRemoved?.filter((tool) => !hidden.has(tool.name)) ?? [];
+		return { ...rest, ...(added.length > 0 ? { toolsAdded: added } : {}), ...(removed.length > 0 ? { toolsRemoved: removed } : {}) };
+	});
+}
+
+/** Mirrors agent-session.js `_installAgentForcedPromptProjection` (timestamp 0 instead of now; not sent). */
+function forcePrompt(messages: Message[], forced: string): Message[] {
+	const current = getCurrentSystemMessage(messages);
+	const head: SystemMessage = {
+		role: "system",
+		content: forced,
+		...(current?.toolsAdded ? { toolsAdded: current.toolsAdded } : {}),
+		timestamp: current?.timestamp ?? 0,
+	};
+	return [head, ...messages.filter((message) => message.role !== "system")];
+}
+
+const IMAGES_BLOCKED = "Image reading is disabled.";
+
+/** Mirrors sdk.js `convertToLlmWithBlockImages`. */
+function blockImages(message: Message): Message {
+	if ((message.role !== "user" && message.role !== "toolResult") || !Array.isArray(message.content)) return message;
+	const content: (TextContent | ImageContent)[] = message.content;
+	if (!content.some((c) => c.type === "image")) return message;
+	const filtered = content
+		.map((c): TextContent | ImageContent => (c.type === "image" ? { type: "text", text: IMAGES_BLOCKED } : c))
+		.filter((c, i, arr) => {
+			const previous = arr[i - 1];
+			return !(c.type === "text" && c.text === IMAGES_BLOCKED && previous?.type === "text" && previous.text === IMAGES_BLOCKED);
+		});
+	return { ...message, content: filtered } as Message;
+}
+
+/** One rendered source message. */
+export interface Entry {
+	role: "user" | "assistant";
+	text: string;
+	timestamp: number;
+	/** The source message's role; "omitted" marks a trimming marker. */
+	source: AgentMessage["role"] | "omitted";
+	/** Tool calls of an assistant message. */
+	calls?: readonly ToolCall[];
+	toolCallId?: string;
+	isError?: boolean;
+}
+
 export interface Turn {
 	role: "user" | "assistant";
 	/** One block per source message, so earlier blocks never change as the transcript grows. */
@@ -30,6 +134,9 @@ export interface Turn {
 export interface TextViewOptions {
 	systemPrompt: string;
 	toolResultChars: number;
+	/** Size limit for the whole view in characters (see `budgetChars`); omitted = no trimming. */
+	budgetChars?: number;
+	pin?: readonly PinItem[];
 }
 
 /**
@@ -38,7 +145,12 @@ export interface TextViewOptions {
  * message after an assistant turn), so every earlier block is byte-identical across steps.
  */
 export function buildTextView(messages: readonly AgentMessage[], options: TextViewOptions): Context {
-	const turns = renderTranscript(messages, options.toolResultChars);
+	let entries = renderEntries(messages, options.toolResultChars);
+	if (options.budgetChars !== undefined) {
+		const fixed = options.systemPrompt.length + BLOCK_SEPARATOR.length + ADVICE_REQUEST.length;
+		entries = trimEntries(entries, { budget: options.budgetChars, fixed, pin: options.pin ?? [] });
+	}
+	const turns = mergeEntries(entries);
 	const last = turns.at(-1);
 	if (last?.role === "user") last.blocks.push(`${BLOCK_SEPARATOR}${ADVICE_REQUEST}`);
 	else turns.push({ role: "user", blocks: [ADVICE_REQUEST], timestamp: last?.timestamp ?? 0 });
@@ -48,21 +160,41 @@ export function buildTextView(messages: readonly AgentMessage[], options: TextVi
 /**
  * Renders the transcript as alternating text turns, starting with a user turn: assistant turns
  * hold the agent's text and ⟨tool …⟩ calls, user turns hold user messages and ⟨result …⟩ blocks.
- * Each message renders on its own into one block, and same-role neighbours merge by appending
- * blocks, so a longer transcript repeats the blocks of its prefix.
  */
 export function renderTranscript(messages: readonly AgentMessage[], toolResultChars: number): Turn[] {
+	return mergeEntries(renderEntries(messages, toolResultChars));
+}
+
+/** Renders each source message on its own; messages with nothing to show are skipped. */
+export function renderEntries(messages: readonly AgentMessage[], toolResultChars: number): Entry[] {
+	const entries: Entry[] = [];
+	for (const source of messages) {
+		for (const message of convertToLlm([source])) {
+			const rendered = renderMessage(message, toolResultChars);
+			if (!rendered) continue;
+			const entry: Entry = { ...rendered, timestamp: message.timestamp, source: source.role };
+			if (message.role === "assistant") entry.calls = message.content.filter((block) => block.type === "toolCall");
+			if (message.role === "toolResult") Object.assign(entry, { toolCallId: message.toolCallId, isError: message.isError });
+			entries.push(entry);
+		}
+	}
+	return entries;
+}
+
+/**
+ * Same-role neighbours merge by appending blocks, so a longer transcript repeats the blocks of
+ * its prefix.
+ */
+function mergeEntries(entries: readonly Entry[]): Turn[] {
 	const turns: Turn[] = [];
-	for (const message of convertToLlm([...messages])) {
-		const rendered = renderMessage(message, toolResultChars);
-		if (!rendered) continue;
+	for (const entry of entries) {
 		const last = turns.at(-1);
-		if (last?.role === rendered.role) {
-			last.blocks.push(`${BLOCK_SEPARATOR}${rendered.text}`);
+		if (last?.role === entry.role) {
+			last.blocks.push(`${BLOCK_SEPARATOR}${entry.text}`);
 			continue;
 		}
-		if (!last && rendered.role === "assistant") turns.push({ role: "user", blocks: [AGENT_FIRST], timestamp: message.timestamp });
-		turns.push({ role: rendered.role, blocks: [rendered.text], timestamp: message.timestamp });
+		if (!last && entry.role === "assistant") turns.push({ role: "user", blocks: [AGENT_FIRST], timestamp: entry.timestamp });
+		turns.push({ role: entry.role, blocks: [entry.text], timestamp: entry.timestamp });
 	}
 	return turns;
 }
@@ -114,29 +246,6 @@ function renderToolCall(call: ToolCall): string {
 	}
 	if (args.length > TOOL_ARGS_CHARS) args = `${head(args, TOOL_ARGS_CHARS)}…`;
 	return `⟨tool ${call.name}(${args})⟩`;
-}
-
-/** Keeps the start and end of `text` within about `max` UTF-16 units, never splitting a surrogate pair. */
-export function truncateMiddle(text: string, max: number): string {
-	if (text.length <= max) return text;
-	const start = head(text, Math.ceil(max / 2));
-	const end = tail(text, max - Math.ceil(max / 2));
-	const omitted = text.length - start.length - end.length;
-	return `${start}\n[… ${omitted} chars omitted …]\n${end}`;
-}
-
-const isHighSurrogate = (code: number) => code >= 0xd800 && code <= 0xdbff;
-const isLowSurrogate = (code: number) => code >= 0xdc00 && code <= 0xdfff;
-
-function head(text: string, n: number): string {
-	const cut = n > 0 && isHighSurrogate(text.charCodeAt(n - 1)) ? n - 1 : n;
-	return text.slice(0, cut);
-}
-
-function tail(text: string, n: number): string {
-	if (n <= 0) return "";
-	const from = text.length - n;
-	return text.slice(isLowSurrogate(text.charCodeAt(from)) ? from + 1 : from);
 }
 
 function toMessage(turn: Turn): Message {

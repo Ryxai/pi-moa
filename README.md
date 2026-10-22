@@ -5,8 +5,42 @@ Mixture of Models for the [pi](https://pi.dev) coding agent. Before your model (
 The design is in [PLAN.md](PLAN.md).
 
 **Status: early.** Config, `/moa on|off` and session state work. While on, the preset's advisors
-run when one of its triggers fires, with a text view of the transcript; their advice is added to
-that request only, and each fresh round is saved as a `moa` session entry with its trigger.
+run when one of its triggers fires; their advice is added to that request only, and each fresh
+round is saved as a `moa` session entry with its trigger.
+
+**What advisors see** (`context.view`, default `"auto"`):
+- `native` (auto: the advisor is the actor's model, e.g. `"current"`): the actor's own request —
+  system prompt, tools, transcript and same-model thinking, projected as pi projects it (a prompt
+  forced by a `before_agent_start` handler, hidden tool declarations, `images.blockImages`) —
+  plus one trailing user message with the advisor's instructions. It uses the actor's thinking
+  level unless the advisor sets `thinking`, and the actor's session id, so it can reuse the actor's
+  prompt cache. `context.nativeToolChoice` (default `"omit"`) sends no tool choice, which keeps
+  the request cache-compatible with the actor's; only the reply's text is used, and a tool-call reply with
+  no text is retried once with tool choice `none` (recorded as `retried`). `"none"` always sends
+  `none` (on Anthropic this stops it reading the actor's cached messages). Bedrock never gets
+  `none` (pi then drops the tool config, which Bedrock rejects with tool history). Project
+  instructions are already in the actor's system prompt. Native views are not trimmed, including
+  `view: "native"` forced on a different model. It also gets pi's `thinkingBudgets` setting, as the
+  actor does. Limit: hidden tool declarations are taken from the run's start; if pi changes that
+  set on a later step of the run, the native request can differ from the actor's.
+- `text` (auto: any other model): a system prompt with the advisor rules and role, plus, with
+  `projectInstructions` (default on), the project context files pi loaded for the current run
+  (AGENTS.md etc., from `before_agent_start`) under "# Project instructions", capped at 8000
+  characters head and tail. The transcript is plain text: tool calls as `⟨tool name(args)⟩`, tool
+  results cut to `toolResultChars` as their own user turns, thinking dropped, images as `[image]`.
+  Text advisors use their own thinking setting (none when unset) and a per-slot session id.
+- **Trimming** (text view, when the advisor model's `contextWindow` is known): the view is kept
+  under `contextWindow × 0.9 − reserve` tokens, estimated at 3 characters per token; the reserve
+  is `maxTokens` (8192 when unset) plus the thinking budget for the advisor's `thinking` level,
+  capped at half the window. Over that, the oldest messages are replaced by
+  `[… N earlier messages omitted …]`; the last two steps, the last message and the `pin` items
+  stay (`task`: the turn's user message; `latestError`: the latest failed tool result and its
+  call; `latestDiff`: the latest file-changing call — edit/write-style tool names, or a path plus
+  content/diff arguments — and its result). Cuts are made in chunks of 30% of the budget, so after
+  a cut the view is at most ~70% full and keeps the same prefix for several steps, which keeps
+  advisor prompt caching working. The prefix also changes when a newer error, edit or user
+  message replaces a pinned one in the trimmed part. If the kept messages alone are too big, the
+  largest are shortened head and tail; then the prefix changes every step.
 
 **Triggers** (per preset, default `["user_turn", "on_failure"]`):
 - `user_turn`: the first request after a user message (including steering and follow-up messages;
@@ -31,11 +65,11 @@ are planned.
 **Prompt caching:** the advice changes every request, so MoA moves the conversation cache marker
 (Anthropic `cache_control`, `cache_control` on OpenRouter `anthropic/*` chat completions, Bedrock
 `cachePoint`) from the advice block to the last conversation block before it, for the actor's
-requests and the advisors' calls. That keeps the conversation prefix cacheable; the advice itself is
-always uncached input. Advisors use their own per-slot provider session id (stable OpenAI
-`prompt_cache_key`). Limits: pi's cache warmer replays the last request including its advice, so
-each warm also pays the advice tokens as uncached input; on Bedrock the cache point is only placed
-in user messages; the effect has not yet been measured against MoA off.
+requests and the advisors' calls (in the native view, off the advisor's instruction message). That
+keeps the conversation prefix cacheable; the advice itself is always uncached input. Limits: pi's
+cache warmer replays the last request including its advice, so each warm also pays the advice
+tokens as uncached input; on Bedrock the cache point is only placed in user messages; the effect
+has not yet been measured against MoA off.
 
 ## Install
 

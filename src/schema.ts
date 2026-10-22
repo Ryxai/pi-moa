@@ -5,6 +5,7 @@ export const BUILTIN_ROLES = ["advisor", "planner", "reviewer", "critic"] as con
 export const STANCES = ["for", "against", "neutral"] as const;
 export const NAMED_TRIGGERS = ["user_turn", "every_step", "on_failure"] as const;
 export const CONTEXT_VIEWS = ["auto", "native", "text"] as const;
+export const NATIVE_TOOL_CHOICES = ["omit", "none"] as const;
 export const PIN_ITEMS = ["task", "latestError", "latestDiff"] as const;
 export const BUDGET_ACTIONS = ["warn", "pause", "stop"] as const;
 export const ADVICE_DISPLAY = ["collapsed", "expanded", "hidden"] as const;
@@ -44,6 +45,11 @@ export interface PresetConfig {
 		projectInstructions: boolean;
 		toolResultChars: number;
 		pin: PinItem[];
+		/**
+		 * Native view: "omit" sends no tool_choice (shares the actor's message cache; a reply with no
+		 * text is retried once with "none"); "none" always sends tool_choice none.
+		 */
+		nativeToolChoice: (typeof NATIVE_TOOL_CHOICES)[number];
 	};
 	framing: { anonymize: boolean; shuffle: boolean };
 	timeoutMs: number;
@@ -60,7 +66,7 @@ export interface MoaConfig {
 
 export const DEFAULT_PRESET: PresetConfig = {
 	actor: "current",
-	advisors: [{ model: "current", role: "advisor", thinking: "high", maxTokens: 2048 }],
+	advisors: [{ model: "current", role: "advisor", maxTokens: 2048 }],
 	triggers: ["user_turn", "on_failure"],
 	onFailure: { consecutiveErrors: 2, repeatedCalls: 3 },
 	consult: { enabled: true, maxPerTurn: 3 },
@@ -69,6 +75,7 @@ export const DEFAULT_PRESET: PresetConfig = {
 		projectInstructions: true,
 		toolResultChars: 4000,
 		pin: ["task", "latestError", "latestDiff"],
+		nativeToolChoice: "omit",
 	},
 	framing: { anonymize: true, shuffle: true },
 	timeoutMs: 90_000,

@@ -1,11 +1,22 @@
+import type { Context, ThinkingBudgets } from "@earendil-works/pi-ai";
 import { runAdvisors, type AdvisorRequest, type AdvisorResult, type CompleteFn } from "./advisors.ts";
 import { resolvePreset, type ModelLike, type ModelLookup } from "./config-resolve.ts";
 import { getPreset, type MoaConfig } from "./config.ts";
 import { arrangeAdvisors } from "./framing.ts";
-import { assemblePrompt, DEFAULT_ROLE, type PromptFileReader } from "./roles.ts";
+import { assemblePrompt, BASE_RULES, DEFAULT_ROLE, NATIVE_BASE_RULES, withProjectInstructions, type PromptFileReader } from "./roles.ts";
 import { moveCacheMarker } from "./cache.ts";
+import type { AdvisorConfig, PresetConfig, ThinkingLevel } from "./schema.ts";
+import { budgetChars } from "./trim.ts";
 import type { TriggerReason } from "./triggers.ts";
-import { ADVICE_REQUEST_BLOCKS, buildTextView, type AgentMessage } from "./view.ts";
+import {
+	ADVICE_REQUEST_BLOCKS,
+	buildNativeView,
+	buildTextView,
+	nativeInstruction,
+	selectView,
+	type AgentMessage,
+	type RequestProjection,
+} from "./view.ts";
 
 export const RECORD_ENTRY = "moa";
 
@@ -29,8 +40,16 @@ export interface RoundInput<M extends ModelLike> {
 	/** The acting model; `"current"` resolves to it. */
 	actor: M | undefined;
 	signal?: AbortSignal;
-	/** pi session id; advisors get their own per-slot provider session id derived from it. */
+	/** pi session id: native advisors use it, text advisors a per-slot id derived from it. */
 	sessionId?: string;
+	/** The actor's thinking level; native advisors without their own use it. */
+	actorThinking?: ThinkingLevel;
+	/** pi's `thinkingBudgets` setting, which the actor's requests use; native advisors get it too. */
+	thinkingBudgets?: ThinkingBudgets;
+	/** How pi projects the actor's request (forced prompt, hidden tools, blocked images). */
+	projection?: RequestProjection;
+	/** Rendered project context files, for text views (see `projectInstructions`). */
+	projectInstructions?: string;
 	reason: TriggerReason;
 	turn: string;
 	step: number;
@@ -44,7 +63,7 @@ export interface RoundOutput {
 }
 
 /**
- * Provider session id for an advisor slot: stable across steps (so OpenAI-style `prompt_cache_key`
+ * Provider session id for a text-view advisor slot: stable across steps (so OpenAI-style `prompt_cache_key`
  * routing keeps hitting the same cache) and distinct from the actor's. The slot prefix comes first
  * because providers may truncate long keys (OpenAI clamps to 64 characters).
  */
@@ -53,7 +72,68 @@ export function advisorSessionId(sessionId: string | undefined, slot: number): s
 }
 
 /** Advisor payload hook: keeps the cache marker off the advice-request block. */
-const advisorPayload = (payload: unknown): unknown => moveCacheMarker(payload, ADVICE_REQUEST_BLOCKS);
+const advisorPayload =
+	(tailTexts: readonly string[]) =>
+	(payload: unknown): unknown =>
+		moveCacheMarker(payload, tailTexts);
+
+export interface AdvisorCall {
+	view: "native" | "text";
+	context: Context;
+	/** Request-local tail texts the cache marker is moved off. */
+	tailTexts: readonly string[];
+	thinking?: ThinkingLevel;
+	thinkingBudgets?: ThinkingBudgets;
+	sessionId?: string;
+	toolChoice?: "none" | "omit";
+}
+
+/**
+ * One advisor's call. Native: the actor's projected request, the actor's thinking level unless
+ * the slot sets one, and the actor's session id, so the request can reuse the actor's cache.
+ * Text: the text view (with project instructions, trimmed to the advisor's window), the slot's
+ * thinking level, and a per-slot session id.
+ */
+export function advisorView<M extends ModelLike>(
+	messages: readonly AgentMessage[],
+	advisor: { model: M; config: AdvisorConfig; slot?: number },
+	context: {
+		input: Pick<RoundInput<M>, "actor" | "config" | "projectInstructions" | "sessionId" | "actorThinking" | "thinkingBudgets" | "projection">;
+		preset: PresetConfig;
+		readPromptFile?: PromptFileReader;
+	},
+): AdvisorCall {
+	const { input, preset } = context;
+	const { config } = advisor;
+	const view = selectView(preset.context.view, advisor.model, input.actor);
+	const prompt = (base: string) => assemblePrompt(config.role, config, input.config.roles, context.readPromptFile, base);
+	if (view === "native") {
+		const instruction = nativeInstruction(prompt(NATIVE_BASE_RULES));
+		return {
+			view,
+			context: buildNativeView(messages, instruction, input.projection),
+			tailTexts: [instruction],
+			thinking: config.thinking ?? input.actorThinking,
+			thinkingBudgets: input.thinkingBudgets,
+			sessionId: input.sessionId,
+			toolChoice: preset.context.nativeToolChoice,
+		};
+	}
+	const instructions = preset.context.projectInstructions ? input.projectInstructions : undefined;
+	const textView = buildTextView(messages, {
+		systemPrompt: withProjectInstructions(prompt(BASE_RULES), instructions),
+		toolResultChars: preset.context.toolResultChars,
+		budgetChars: budgetChars(advisor.model.contextWindow, config.maxTokens, config.thinking),
+		pin: preset.context.pin,
+	});
+	return {
+		view,
+		context: textView,
+		tailTexts: ADVICE_REQUEST_BLOCKS,
+		thinking: config.thinking,
+		sessionId: advisorSessionId(input.sessionId, advisor.slot ?? 0),
+	};
+}
 
 export interface RoundDeps<M> {
 	complete: CompleteFn<M>;
@@ -90,19 +170,21 @@ export async function runRound<M extends ModelLike>(input: RoundInput<M>, deps: 
 		...preset.framing,
 		rng: deps.rng,
 	});
-	const requests: AdvisorRequest<M>[] = arranged.map(({ item, label }) => ({
-		label,
-		model: item.model,
-		role: item.config.role ?? DEFAULT_ROLE,
-		context: buildTextView(input.messages, {
-			systemPrompt: assemblePrompt(item.config.role, item.config, input.config.roles, deps.readPromptFile),
-			toolResultChars: preset.context.toolResultChars,
-		}),
-		thinking: item.config.thinking,
-		maxTokens: item.config.maxTokens,
-		sessionId: advisorSessionId(input.sessionId, item.slot),
-		onPayload: advisorPayload,
-	}));
+	const requests: AdvisorRequest<M>[] = arranged.map(({ item, label }) => {
+		const call = advisorView(input.messages, item, { input, preset, readPromptFile: deps.readPromptFile });
+		return {
+			label,
+			model: item.model,
+			role: item.config.role ?? DEFAULT_ROLE,
+			context: call.context,
+			thinking: call.thinking,
+			thinkingBudgets: call.thinkingBudgets,
+			maxTokens: item.config.maxTokens,
+			sessionId: call.sessionId,
+			onPayload: advisorPayload(call.tailTexts),
+			toolChoice: call.toolChoice,
+		};
+	});
 	const results = await runAdvisors(requests, { complete: deps.complete, signal: input.signal, timeoutMs: preset.timeoutMs, now });
 
 	const interrupted = input.signal?.aborted === true;

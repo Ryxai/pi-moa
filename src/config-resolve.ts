@@ -3,6 +3,9 @@ import type { AdvisorConfig, PresetConfig } from "./schema.ts";
 export interface ModelLike {
 	provider: string;
 	id: string;
+	/** pi's `Model` fields that advisor calls use when present. */
+	api?: string;
+	contextWindow?: number;
 }
 
 /** The slice of pi's ModelRegistry that resolution needs. */

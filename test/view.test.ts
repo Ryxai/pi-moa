@@ -1,6 +1,18 @@
-import type { Message } from "@earendil-works/pi-ai";
+import { Type, type Message } from "@earendil-works/pi-ai";
+import { convertToLlm } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
-import { ADVICE_REQUEST, buildTextView, renderTranscript, TOOL_ARGS_CHARS, truncateMiddle, type AgentMessage } from "../src/view.ts";
+import {
+	ADVICE_REQUEST,
+	buildNativeView,
+	buildTextView,
+	nativeInstruction,
+	renderEntries,
+	renderTranscript,
+	selectView,
+	TOOL_ARGS_CHARS,
+	type AgentMessage,
+} from "../src/view.ts";
+import { truncateMiddle } from "../src/text.ts";
 import { assistant, system, text, toolResult, user } from "./fixtures.ts";
 
 const turns = (messages: AgentMessage[], chars = 4000) => renderTranscript(messages, chars).map((t) => [t.role, t.blocks]);
@@ -177,5 +189,99 @@ describe("truncateMiddle", () => {
 		expect(out).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
 		expect(out.startsWith("😀")).toBe(true);
 		expect(out.endsWith("😀")).toBe(true);
+	});
+});
+
+describe("selectView", () => {
+	const sonnet = { provider: "anthropic", id: "sonnet" };
+	it("auto is native only for the actor's own model", () => {
+		expect(selectView("auto", sonnet, { ...sonnet })).toBe("native");
+		expect(selectView("auto", sonnet, { provider: "openrouter", id: "sonnet" })).toBe("text");
+		expect(selectView("auto", sonnet, { provider: "anthropic", id: "opus" })).toBe("text");
+		expect(selectView("auto", sonnet, undefined)).toBe("text");
+	});
+
+	it("native and text are forced", () => {
+		expect(selectView("text", sonnet, sonnet)).toBe("text");
+		expect(selectView("native", sonnet, { provider: "openai", id: "gpt" })).toBe("native");
+	});
+});
+
+describe("buildNativeView", () => {
+	const bash = { name: "bash", description: "Run", parameters: Type.Object({ command: Type.String() }) };
+	const transcript: AgentMessage[] = [
+		{ role: "system", content: "You are pi.", sections: { cwd: "<cwd>\n/repo\n</cwd>" }, toolsAdded: [bash], timestamp: 0 },
+		user("Fix it"),
+		assistant([{ type: "thinking", thinking: "plan", thinkingSignature: "sig" }, text("Running."), call("bash", { command: "npm test" })], {
+			stopReason: "toolUse",
+		}),
+		toolResult("bash", "1 failing", true),
+		{ role: "custom", customType: "note", content: "A reminder.", display: true, timestamp: 4 },
+		{ role: "system", content: "", toolsRemoved: [{ name: "bash" }], timestamp: 5 },
+	];
+
+	it("is the actor's converted request, system messages and thinking included, plus one trailing instruction", () => {
+		const view = buildNativeView(transcript, nativeInstruction("You advise."));
+		expect(view.systemPrompt).toBeUndefined();
+		expect(view.tools).toBeUndefined();
+		expect(view.messages.slice(0, -1)).toEqual(convertToLlm(structuredClone(transcript)));
+		expect(view.messages.at(-1)).toEqual({ role: "user", content: [text(`You advise.\n\n${ADVICE_REQUEST}`)], timestamp: 5 });
+	});
+
+	it("mirrors pi's forced-prompt projection: one head with the forced text and current tools", () => {
+		const read = { name: "read", description: "Read", parameters: Type.Object({}) };
+		const withRead: AgentMessage[] = [...transcript.slice(0, -1), { role: "system", content: "More rules.", toolsAdded: [read], timestamp: 6 }];
+		const view = buildNativeView(withRead, "x", { forceSystemPrompt: "FORCED" });
+		expect(view.messages[0]).toEqual({ role: "system", content: "FORCED", toolsAdded: [bash, read], timestamp: 0 });
+		expect(view.messages.filter((m) => m.role === "system")).toHaveLength(1);
+		expect(view.messages.slice(1, -1)).toEqual(convertToLlm(structuredClone(withRead)).filter((m) => m.role !== "system"));
+		// Every tool removed: no toolsAdded on the head.
+		expect(buildNativeView(transcript, "x", { forceSystemPrompt: "F" }).messages[0]).toEqual({ role: "system", content: "F", timestamp: 0 });
+	});
+
+	it("mirrors pi's hidden-declaration projection", () => {
+		const view = buildNativeView(transcript, "x", { hiddenTools: ["bash"] });
+		const systems = view.messages.filter((m) => m.role === "system");
+		expect(systems.map((m) => [m.toolsAdded, m.toolsRemoved])).toEqual([
+			[undefined, undefined],
+			[undefined, undefined],
+		]);
+		expect(systems[0]).toMatchObject({ content: "You are pi.", sections: { cwd: "<cwd>\n/repo\n</cwd>" } });
+	});
+
+	it("mirrors pi's blockImages filter on user and tool-result images", () => {
+		const image = { type: "image" as const, data: "AAAA", mimeType: "image/png" };
+		const messages: AgentMessage[] = [
+			{ role: "user", content: [text("see"), image, image, text("and")], timestamp: 1 },
+			{ role: "toolResult", toolCallId: "c1", toolName: "read", content: [image], isError: false, timestamp: 2 },
+		];
+		const blocked = { type: "text", text: "Image reading is disabled." };
+		const view = buildNativeView(messages, "x", { blockImages: true });
+		expect(view.messages[0]!.content).toEqual([text("see"), blocked, text("and")]);
+		expect(view.messages[1]!.content).toEqual([blocked]);
+		expect(buildNativeView(messages, "x", { blockImages: false }).messages[0]!.content).toContainEqual(image);
+	});
+
+	it("does not modify the input", () => {
+		const copy = structuredClone(transcript);
+		buildNativeView(transcript, "x", { forceSystemPrompt: "F", hiddenTools: ["bash"], blockImages: true });
+		expect(transcript).toEqual(copy);
+	});
+});
+
+describe("renderEntries", () => {
+	it("keeps one entry per rendered message with its source, calls and result metadata", () => {
+		const entries = renderEntries(
+			[system("sys"), user("go"), assistant([call("edit", { path: "a" })]), toolResult("edit", "ok", true), { role: "custom", customType: "n", content: "hi", display: true, timestamp: 5 }],
+			100,
+		);
+		expect(entries.map((e) => [e.role, e.source])).toEqual([
+			["user", "user"],
+			["assistant", "assistant"],
+			["user", "toolResult"],
+			["user", "custom"],
+		]);
+		expect(entries[1]?.calls?.map((c) => c.name)).toEqual(["edit"]);
+		expect(entries[2]).toMatchObject({ toolCallId: "c1", isError: true });
 	});
 });

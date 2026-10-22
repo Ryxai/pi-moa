@@ -1,4 +1,12 @@
-import { getCurrentTools, normalizeContext, type AssistantMessage, type Context, type SimpleStreamOptions, type Usage } from "@earendil-works/pi-ai";
+import {
+	getCurrentTools,
+	normalizeContext,
+	type AssistantMessage,
+	type Context,
+	type SimpleStreamOptions,
+	type ThinkingBudgets,
+	type Usage,
+} from "@earendil-works/pi-ai";
 import type { ModelLike } from "./config-resolve.ts";
 import type { ThinkingLevel } from "./schema.ts";
 
@@ -11,11 +19,18 @@ export interface AdvisorRequest<M extends ModelLike> {
 	role: string;
 	context: Context;
 	thinking?: ThinkingLevel;
+	/** Token budgets per thinking level (pi's `thinkingBudgets` setting), as the actor gets them. */
+	thinkingBudgets?: ThinkingBudgets;
 	maxTokens?: number;
 	/** Provider session id: stable `prompt_cache_key` / session routing for this advisor slot. */
 	sessionId?: string;
 	/** Provider payload hook for this call (the cache-marker fix). */
 	onPayload?: SimpleStreamOptions["onPayload"];
+	/**
+	 * With tools declared (native view): "none" (default) sends tool_choice none; "omit" sends
+	 * none only on one retry when the first reply called tools and has no text.
+	 */
+	toolChoice?: "none" | "omit";
 }
 
 export interface AdvisorResult {
@@ -29,6 +44,8 @@ export interface AdvisorResult {
 	usage?: Usage;
 	costUsd?: number;
 	latencyMs: number;
+	/** The first reply had no text and the call was repeated with tool_choice none. */
+	retried?: true;
 }
 
 export interface RunOptions<M> {
@@ -69,37 +86,77 @@ async function runAdvisor<M extends ModelLike>(advisor: AdvisorRequest<M>, optio
 	});
 	stopped.catch(() => {});
 
+	const call = (forceNone: boolean) =>
+		Promise.race([options.complete(advisor.model, advisor.context, callOptions(advisor, controller.signal, forceNone)), stopped]);
+	let retried = false;
 	try {
-		const message = await Promise.race([options.complete(advisor.model, advisor.context, callOptions(advisor, controller.signal)), stopped]);
-		const latency = now() - start;
-		if (reason) return failure(advisor, reason, latency);
-		const usage = message.usage;
-		const extra = { usage, costUsd: usage?.cost?.total };
-		if (message.stopReason === "error" || message.stopReason === "aborted") {
-			return { ...failure(advisor, message.errorMessage ?? message.stopReason, latency), ...extra };
+		const tools = declaresTools(advisor);
+		let message = await call(false);
+		let usage: Usage | undefined = message.usage;
+		// Same timeout and abort as the first call.
+		// Only tool-call replies: a length-capped or thinking-only empty reply would likely be empty again.
+		if (!reason && tools && advisor.toolChoice === "omit" && message.stopReason === "toolUse" && !textOf(message) && canForceNone(advisor)) {
+			retried = true;
+			message = await call(true);
+			usage = addUsage(usage, message.usage);
 		}
-		const text = message.content
-			.filter((block) => block.type === "text")
-			.map((block) => block.text)
-			.join("\n")
-			.trim();
+		const latency = now() - start;
+		const extra = { usage, costUsd: usage?.cost?.total, ...(retried && { retried: true as const }) };
+		if (reason) return { ...failure(advisor, reason, latency), ...extra };
+		if (!isUsable(message)) return { ...failure(advisor, message.errorMessage ?? message.stopReason, latency), ...extra };
+		const text = textOf(message);
 		if (!text) return { ...failure(advisor, "empty response", latency), ...extra };
 		return { ...base(advisor), ok: true, text, ...extra, latencyMs: latency };
 	} catch (error) {
-		return failure(advisor, reason ?? errorText(error), now() - start);
+		return { ...failure(advisor, reason ?? errorText(error), now() - start), ...(retried && { retried: true as const }) };
 	} finally {
 		clearTimeout(timer);
 		outer?.removeEventListener("abort", onOuterAbort);
 	}
 }
 
-function callOptions(advisor: AdvisorRequest<ModelLike>, signal: AbortSignal): SimpleStreamOptions {
+const BEDROCK_API = "bedrock-converse-stream";
+
+/**
+ * Tools may come from `Context.tools` or system-message deltas; adapters send `tool_choice` even
+ * with no tools, which providers can reject.
+ */
+const declaresTools = (advisor: AdvisorRequest<ModelLike>) => getCurrentTools(normalizeContext(advisor.context).messages).length > 0;
+
+/** For `none` pi drops Bedrock's `toolConfig`, which Bedrock rejects when the history holds tool blocks. */
+const canForceNone = (advisor: AdvisorRequest<ModelLike>) => advisor.model.api !== BEDROCK_API;
+
+const isUsable = (message: AssistantMessage) => message.stopReason !== "error" && message.stopReason !== "aborted";
+
+/** Only the reply's text counts; tool calls and thinking are ignored. */
+function textOf(message: AssistantMessage): string {
+	return message.content
+		.filter((block) => block.type === "text")
+		.map((block) => block.text)
+		.join("\n")
+		.trim();
+}
+
+function addUsage(a: Usage | undefined, b: Usage | undefined): Usage | undefined {
+	if (!a || !b) return a ?? b;
+	const cost = (key: keyof Usage["cost"]) => (a.cost?.[key] ?? 0) + (b.cost?.[key] ?? 0);
+	return {
+		input: a.input + b.input,
+		output: a.output + b.output,
+		cacheRead: a.cacheRead + b.cacheRead,
+		cacheWrite: a.cacheWrite + b.cacheWrite,
+		totalTokens: a.totalTokens + b.totalTokens,
+		cost: { input: cost("input"), output: cost("output"), cacheRead: cost("cacheRead"), cacheWrite: cost("cacheWrite"), total: cost("total") },
+	};
+}
+
+function callOptions(advisor: AdvisorRequest<ModelLike>, signal: AbortSignal, forceNone: boolean): SimpleStreamOptions {
 	const options: SimpleStreamOptions = { signal };
-	// Tools may come from `Context.tools` or system-message deltas; adapters send `tool_choice`
-	// even with no tools, which providers can reject.
-	if (getCurrentTools(normalizeContext(advisor.context).messages).length > 0) options.toolChoice = "none";
+	const none = forceNone || advisor.toolChoice !== "omit";
+	if (none && declaresTools(advisor) && canForceNone(advisor)) options.toolChoice = "none";
 	if (advisor.maxTokens !== undefined) options.maxTokens = advisor.maxTokens;
 	if (advisor.thinking && advisor.thinking !== "off") options.reasoning = advisor.thinking;
+	if (advisor.thinkingBudgets) options.thinkingBudgets = advisor.thinkingBudgets;
 	if (advisor.sessionId) options.sessionId = advisor.sessionId;
 	if (advisor.onPayload) options.onPayload = advisor.onPayload;
 	return options;
