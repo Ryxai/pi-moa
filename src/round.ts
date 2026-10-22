@@ -4,7 +4,8 @@ import { getPreset, type MoaConfig } from "./config.ts";
 import { arrangeAdvisors, frameAdvice } from "./framing.ts";
 import { assemblePrompt, DEFAULT_ROLE, type PromptFileReader } from "./roles.ts";
 import { turnPosition, type TurnPosition } from "./state.ts";
-import { buildTextView, type AgentMessage } from "./view.ts";
+import { moveCacheMarker } from "./cache.ts";
+import { ADVICE_REQUEST_BLOCKS, buildTextView, type AgentMessage } from "./view.ts";
 
 export const RECORD_ENTRY = "moa";
 
@@ -21,7 +22,28 @@ export interface RoundInput<M extends ModelLike> {
 	/** The acting model; `"current"` resolves to it. */
 	actor: M | undefined;
 	signal?: AbortSignal;
+	/** pi session id; advisors get their own per-slot provider session id derived from it. */
+	sessionId?: string;
 }
+
+export interface RoundOutput {
+	/** The request's messages with the advice appended. */
+	messages: AgentMessage[];
+	/** The exact advice text injected (the trailing user message's only text block). */
+	advice: string;
+}
+
+/**
+ * Provider session id for an advisor slot: stable across steps (so OpenAI-style `prompt_cache_key`
+ * routing keeps hitting the same cache) and distinct from the actor's. The slot prefix comes first
+ * because providers may truncate long keys (OpenAI clamps to 64 characters).
+ */
+export function advisorSessionId(sessionId: string | undefined, slot: number): string | undefined {
+	return sessionId ? `moa${slot}-${sessionId}` : undefined;
+}
+
+/** Advisor payload hook: keeps the cache marker off the advice-request block. */
+const advisorPayload = (payload: unknown): unknown => moveCacheMarker(payload, ADVICE_REQUEST_BLOCKS);
 
 export interface RoundDeps<M> {
 	complete: CompleteFn<M>;
@@ -34,9 +56,9 @@ export interface RoundDeps<M> {
 
 /**
  * Runs one advisor round and returns the request's messages with the advice appended as a
- * trailing user message, or undefined when there is no advice. `input.messages` is not modified.
+ * trailing user message (plus the advice text), or undefined when there is no advice. `input.messages` is not modified.
  */
-export async function runRound<M extends ModelLike>(input: RoundInput<M>, deps: RoundDeps<M>): Promise<AgentMessage[] | undefined> {
+export async function runRound<M extends ModelLike>(input: RoundInput<M>, deps: RoundDeps<M>): Promise<RoundOutput | undefined> {
 	const debug = deps.debug ?? (() => {});
 	const now = deps.now ?? Date.now;
 	const preset = getPreset(input.config, input.presetName);
@@ -51,7 +73,8 @@ export async function runRound<M extends ModelLike>(input: RoundInput<M>, deps: 
 	}
 	if (resolved.preset.advisors.length === 0) return undefined;
 
-	const arranged = arrangeAdvisors(resolved.preset.advisors, (a) => `${a.model.provider}/${a.model.id}`, {
+	const slots = resolved.preset.advisors.map((advisor, slot) => ({ ...advisor, slot }));
+	const arranged = arrangeAdvisors(slots, (a) => `${a.model.provider}/${a.model.id}`, {
 		...preset.framing,
 		rng: deps.rng,
 	});
@@ -65,6 +88,8 @@ export async function runRound<M extends ModelLike>(input: RoundInput<M>, deps: 
 		}),
 		thinking: item.config.thinking,
 		maxTokens: item.config.maxTokens,
+		sessionId: advisorSessionId(input.sessionId, item.slot),
+		onPayload: advisorPayload,
 	}));
 	const results = await runAdvisors(requests, { complete: deps.complete, signal: input.signal, timeoutMs: preset.timeoutMs, now });
 
@@ -79,5 +104,5 @@ export async function runRound<M extends ModelLike>(input: RoundInput<M>, deps: 
 	const text = frameAdvice(results);
 	if (!text) return undefined;
 	const advice: AgentMessage = { role: "user", content: [{ type: "text", text }], timestamp: now() };
-	return [...input.messages, advice];
+	return { messages: [...input.messages, advice], advice: text };
 }

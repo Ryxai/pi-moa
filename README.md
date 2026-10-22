@@ -7,8 +7,17 @@ The design is in [PLAN.md](PLAN.md).
 **Status: early.** Config, `/moa on|off` and session state work. While on, the preset's advisors
 run on **every** model request (triggers are not applied yet) with a text view of the transcript;
 their advice is added to that request only, and each round is saved as a `moa` session entry.
-Triggers, the `consult` tool, the cache-marker fix, the advice renderer, `moa/<preset>` virtual
-models and one-shot `/moa <prompt>` are planned.
+Triggers, the `consult` tool, the advice renderer, `moa/<preset>` virtual models and one-shot
+`/moa <prompt>` are planned.
+
+**Prompt caching:** the advice changes every request, so MoA moves the conversation cache marker
+(Anthropic `cache_control`, `cache_control` on OpenRouter `anthropic/*` chat completions, Bedrock
+`cachePoint`) from the advice block to the last conversation block before it, for the actor's
+requests and the advisors' calls. That keeps the conversation prefix cacheable; the advice itself is
+always uncached input. Advisors use their own per-slot provider session id (stable OpenAI
+`prompt_cache_key`). Limits: pi's cache warmer replays the last request including its advice, so
+each warm also pays the advice tokens as uncached input; on Bedrock the cache point is only placed
+in user messages; the effect has not yet been measured against MoA off.
 
 ## Install
 

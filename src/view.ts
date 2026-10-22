@@ -14,6 +14,9 @@ export const ADVICE_REQUEST =
  */
 const BLOCK_SEPARATOR = "\n\n";
 
+/** The exact texts the advice-request block can have (its own message, or appended to a user turn). */
+export const ADVICE_REQUEST_BLOCKS: readonly string[] = [ADVICE_REQUEST, `${BLOCK_SEPARATOR}${ADVICE_REQUEST}`];
+
 const AGENT_FIRST = "(The transcript starts with the agent.)";
 
 export interface Turn {
@@ -43,9 +46,10 @@ export function buildTextView(messages: readonly AgentMessage[], options: TextVi
 }
 
 /**
- * Renders the transcript as alternating text turns, starting with a user turn. Each message
- * renders on its own into one block, and turns only grow by appending blocks, so a longer
- * transcript repeats the blocks of its prefix.
+ * Renders the transcript as alternating text turns, starting with a user turn: assistant turns
+ * hold the agent's text and ⟨tool …⟩ calls, user turns hold user messages and ⟨result …⟩ blocks.
+ * Each message renders on its own into one block, and same-role neighbours merge by appending
+ * blocks, so a longer transcript repeats the blocks of its prefix.
  */
 export function renderTranscript(messages: readonly AgentMessage[], toolResultChars: number): Turn[] {
 	const turns: Turn[] = [];
@@ -83,7 +87,10 @@ function renderMessage(message: Message, toolResultChars: number): { role: Turn[
 				.join("\n\n");
 			break;
 		case "toolResult": {
-			role = "assistant";
+			// Results form their own user turn, as in a real transcript, so each step appends new
+			// messages instead of growing the agent's turn (adapters such as openai-completions join
+			// an assistant message's text parts into one string, which would defeat prompt caching).
+			role = "user";
 			const body = truncateMiddle(renderContent(message.content), toolResultChars);
 			text = `⟨result ${message.toolName}${message.isError ? " (error)" : ""}: ${body}⟩`;
 			break;

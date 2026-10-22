@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { moveCacheMarker } from "./cache.ts";
 import { completeMoaArgs, parseMoaArgs } from "./commands.ts";
 import { CONFIG_FILE, loadConfig, writeDefaultConfig, type LoadedConfig } from "./config-io.ts";
 import { resolvePreset } from "./config-resolve.ts";
@@ -7,6 +8,9 @@ import { formatIssues, getPreset, issuesFor } from "./config.ts";
 import { createDebugLog, debugLogPath } from "./debug.ts";
 import { runRound } from "./round.ts";
 import { OFF, reconstructState, STATE_ENTRY, type MoaState } from "./state.ts";
+
+/** How many recent advice texts the cache-marker hook recognises. */
+const TRACKED_ADVICE = 3;
 
 export default function moa(pi: ExtensionAPI): void {
 	const globalConfigPath = join(getAgentDir(), CONFIG_FILE);
@@ -16,6 +20,14 @@ export default function moa(pi: ExtensionAPI): void {
 	/** What the branch says; can differ from `state` when a restore is forced off without persisting. */
 	let persisted: MoaState = OFF;
 	let contextCalls = 0;
+	/**
+	 * The last few advice texts injected into actor requests, newest last. `before_provider_request`
+	 * has no request id, so payloads are matched by exact advice text, which only a replay of one of
+	 * our requests can contain (advice is never persisted). Older entries are kept because pi's
+	 * cache warmer replays an earlier request (with its advice) while later rounds run or after
+	 * rounds that produced no advice or were aborted.
+	 */
+	let injected: string[] = [];
 
 	async function reload(ctx: ExtensionContext): Promise<LoadedConfig> {
 		loaded = await loadConfig({
@@ -75,6 +87,7 @@ export default function moa(pi: ExtensionAPI): void {
 
 	async function restore(ctx: ExtensionContext): Promise<void> {
 		contextCalls = 0;
+		injected = [];
 		const config = await reload(ctx);
 		for (const note of config.notes) notify(ctx, `MoA: ${note}`, "warning");
 		persisted = reconstructState(ctx.sessionManager.getBranch());
@@ -102,8 +115,16 @@ export default function moa(pi: ExtensionAPI): void {
 		const config = loaded;
 		setWorking(ctx, "MoA: advisors…");
 		try {
-			const messages = await runRound(
-				{ messages: event.messages, config: config.config, presetName: state.preset, models: ctx.modelRegistry, actor: ctx.model, signal: ctx.signal },
+			const round = await runRound(
+				{
+					messages: event.messages,
+					config: config.config,
+					presetName: state.preset,
+					models: ctx.modelRegistry,
+					actor: ctx.model,
+					signal: ctx.signal,
+					sessionId: sessionIdOf(ctx),
+				},
 				{
 					complete: (model, context, options) => ctx.modelRegistry.streamSimple(model, context, options).result(),
 					appendEntry: (type, data) => pi.appendEntry(type, data),
@@ -111,12 +132,29 @@ export default function moa(pi: ExtensionAPI): void {
 					debug,
 				},
 			);
-			return messages ? { messages } : undefined;
+			if (!round) return undefined;
+			injected = [...injected, round.advice].slice(-TRACKED_ADVICE);
+			return { messages: round.messages };
 		} catch (error) {
 			debug(`round failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`);
 			return undefined;
 		} finally {
 			setWorking(ctx);
+		}
+	});
+
+	// Keep the actor's conversation cache marker off the advice block (see cache.ts). Fires for
+	// the agent's own requests, their retries and pi's cache-warmer replays; not for advisor calls,
+	// which get the same fix through their own `onPayload`.
+	pi.on("before_provider_request", (event) => {
+		if (injected.length === 0) return undefined;
+		try {
+			const next = moveCacheMarker(event.payload, injected);
+			if (next === event.payload) return undefined;
+			debug("cache marker moved off the advice block");
+			return next;
+		} catch {
+			return undefined;
 		}
 	});
 
@@ -169,6 +207,14 @@ export default function moa(pi: ExtensionAPI): void {
 			}
 		},
 	});
+}
+
+function sessionIdOf(ctx: ExtensionContext): string | undefined {
+	try {
+		return ctx.sessionManager.getSessionId();
+	} catch {
+		return undefined;
+	}
 }
 
 function statusText(config: LoadedConfig, state: MoaState): string {

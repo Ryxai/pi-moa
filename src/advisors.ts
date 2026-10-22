@@ -12,6 +12,10 @@ export interface AdvisorRequest<M extends ModelLike> {
 	context: Context;
 	thinking?: ThinkingLevel;
 	maxTokens?: number;
+	/** Provider session id: stable `prompt_cache_key` / session routing for this advisor slot. */
+	sessionId?: string;
+	/** Provider payload hook for this call (the cache-marker fix). */
+	onPayload?: SimpleStreamOptions["onPayload"];
 }
 
 export interface AdvisorResult {
@@ -96,6 +100,8 @@ function callOptions(advisor: AdvisorRequest<ModelLike>, signal: AbortSignal): S
 	if (getCurrentTools(normalizeContext(advisor.context).messages).length > 0) options.toolChoice = "none";
 	if (advisor.maxTokens !== undefined) options.maxTokens = advisor.maxTokens;
 	if (advisor.thinking && advisor.thinking !== "off") options.reasoning = advisor.thinking;
+	if (advisor.sessionId) options.sessionId = advisor.sessionId;
+	if (advisor.onPayload) options.onPayload = advisor.onPayload;
 	return options;
 }
 

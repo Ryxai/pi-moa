@@ -44,6 +44,7 @@ describe("runAdvisors", () => {
 
 	it("passes call options; reasoning omitted when off, toolChoice only when tools are declared", async () => {
 		const seen: SimpleStreamOptions[] = [];
+		const hook = (payload: unknown) => payload;
 		const complete: CompleteFn<ModelLike> = async (_m, _c, options) => {
 			seen.push(options);
 			return reply("ok");
@@ -55,7 +56,7 @@ describe("runAdvisors", () => {
 		};
 		await runAdvisors(
 			[
-				request("A", gpt, { thinking: "high", maxTokens: 512 }),
+				request("A", gpt, { thinking: "high", maxTokens: 512, sessionId: "moa0-s", onPayload: hook }),
 				request("B", gpt, { thinking: "off" }),
 				request("C", gpt, { context: declared }),
 				request("D", gpt, { context: { ...context, tools: [read] } }),
@@ -63,11 +64,13 @@ describe("runAdvisors", () => {
 			],
 			{ complete, timeoutMs: 1000 },
 		);
-		expect(seen[0]).toMatchObject({ reasoning: "high", maxTokens: 512 });
+		expect(seen[0]).toMatchObject({ reasoning: "high", maxTokens: 512, sessionId: "moa0-s", onPayload: hook });
 		expect(seen[0]?.signal).toBeInstanceOf(AbortSignal);
 		expect(seen[0]).not.toHaveProperty("toolChoice");
 		expect(seen[1]).not.toHaveProperty("reasoning");
 		expect(seen[1]).not.toHaveProperty("maxTokens");
+		expect(seen[1]).not.toHaveProperty("sessionId");
+		expect(seen[1]).not.toHaveProperty("onPayload");
 		expect(seen[2]).toMatchObject({ toolChoice: "none" });
 		expect(seen[3]).toMatchObject({ toolChoice: "none" });
 		expect(seen[4]).not.toHaveProperty("toolChoice");

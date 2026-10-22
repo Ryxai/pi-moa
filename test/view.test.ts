@@ -20,22 +20,33 @@ describe("renderTranscript", () => {
 		]);
 	});
 
-	it("renders tool calls and attaches results to the assistant turn, one block per message", () => {
+	it("renders tool calls in the assistant turn and results as their own user turn, one block per message", () => {
 		const out = turns([
 			user("Read it"),
-			assistant([text("Reading."), call("read", { path: "a.ts" })]),
-			toolResult("read", "file body"),
+			assistant([text("Reading."), call("read", { path: "a.ts" }), call("read", { path: "b.ts" })]),
+			toolResult("read", "file a"),
+			toolResult("read", "file b"),
+			user("and hurry", 9),
 			assistant([text("Done.")]),
 		]);
 		expect(out).toEqual([
 			["user", ["Read it"]],
-			["assistant", ['Reading.\n\n⟨tool read({"path":"a.ts"})⟩', "\n\n⟨result read: file body⟩", "\n\nDone."]],
+			["assistant", ['Reading.\n\n⟨tool read({"path":"a.ts"})⟩\n\n⟨tool read({"path":"b.ts"})⟩']],
+			["user", ["⟨result read: file a⟩", "\n\n⟨result read: file b⟩", "\n\nand hurry"]],
+			["assistant", ["Done."]],
+		]);
+	});
+
+	it("starts with the results when the transcript starts with a tool result", () => {
+		expect(turns([toolResult("bash", "ok"), assistant([text("Next.")])])).toEqual([
+			["user", ["⟨result bash: ok⟩"]],
+			["assistant", ["Next."]],
 		]);
 	});
 
 	it("marks error results and truncates long results head and tail", () => {
 		const long = `${"a".repeat(50)}${"b".repeat(50)}`;
-		const [, turn] = renderTranscript([user("go"), toolResult("bash", long, true)], 20);
+		const [, , turn] = renderTranscript([user("go"), assistant([call("bash", {})]), toolResult("bash", long, true)], 20);
 		expect(turn?.blocks).toEqual([`⟨result bash (error): ${"a".repeat(10)}\n[… 80 chars omitted …]\n${"b".repeat(10)}⟩`]);
 	});
 
@@ -117,7 +128,12 @@ describe("append-only rendering", () => {
 			expect(part.systemPrompt).toBe(full.systemPrompt);
 			const partBlocks = blocks(part.messages);
 			expect(blocks(full.messages).slice(0, partBlocks.length)).toEqual(partBlocks);
+			// Whole messages repeat too: only the last turn (and the request) can differ, so each
+			// step appends messages rather than growing one (adapters may join a message's parts).
+			const settled = part.messages.slice(0, -2);
+			expect(full.messages.slice(0, settled.length)).toEqual(settled);
 		}
+		expect(full.messages.map((m) => m.role)).toEqual(["user", "assistant", "user", "assistant", "user", "assistant", "user"]);
 		expect(buildTextView(all, options)).toEqual(full);
 	});
 });

@@ -77,7 +77,8 @@ Separately, a `before_provider_request` hook moves the cache marker off the advi
     (`projectInstructions: true` by default).
   - User and assistant text only; thinking dropped.
   - Tool calls rendered as `⟨tool name(args)⟩`. This is a format advisors won't imitate as output.
-  - Tool results cut to the start and end at `toolResultChars`, attached to the preceding assistant text.
+  - Tool results cut to the start and end at `toolResultChars`, as their own user turn (`⟨result name: …⟩`), so
+    turns alternate like a real transcript and each step appends messages.
   - Images replaced with a placeholder.
   - Always ends with a user message asking for the advisor's judgement.
   - Rendering only ever appends, so advisor prompt caching works across steps.
