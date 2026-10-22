@@ -1,5 +1,7 @@
 import { join } from "node:path";
+import type { ThinkingBudgets } from "@earendil-works/pi-ai";
 import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { branchSpend, budgetAction, BudgetTracker, formatUsd, spendText, type BudgetAction, type Spend } from "./budget.ts";
 import { adviceText, cacheForTurn, decideRound, storeRound, type TurnCache } from "./advice-cache.ts";
 import { moveCacheMarker } from "./cache.ts";
@@ -9,11 +11,11 @@ import { CONFIG_FILE, loadConfig, writeDefaultConfig, type LoadedConfig } from "
 import { resolvePreset } from "./config-resolve.ts";
 import { formatIssues, getPreset, issuesFor, type PresetConfig } from "./config.ts";
 import { createDebugLog, debugLogPath } from "./debug.ts";
+import { progressText, renderConsultResult, renderEntry, consultCallText, statusLine, type AdviceDisplay } from "./render.ts";
 import { projectInstructions, type PromptOptionsLike } from "./roles.ts";
 import { appendAdvice, RECORD_ENTRY, runRound, type RoundDeps, type RoundInput } from "./round.ts";
 import { OFF, reconstructState, STATE_ENTRY, type MoaState } from "./state.ts";
-import type { ThinkingBudgets } from "@earendil-works/pi-ai";
-import type { ThinkingLevel } from "./schema.ts";
+import { ADVICE_DISPLAY, type ThinkingLevel } from "./schema.ts";
 import { analyzeTurn } from "./triggers.ts";
 import type { AgentMessage, RequestProjection } from "./view.ts";
 
@@ -104,7 +106,7 @@ export default function moa(pi: ExtensionAPI): void {
 	function updateStatus(ctx: ExtensionContext): void {
 		const show = state.enabled && (loaded?.config.ui.status ?? true);
 		try {
-			if (ctx.hasUI) ctx.ui.setStatus("moa", show ? `moa:${state.preset}` : undefined);
+			if (ctx.hasUI) ctx.ui.setStatus("moa", show && state.preset ? statusLine(state.preset, budget.spend, loaded?.config.budget) : undefined);
 		} catch {
 			// Display must never break a turn.
 		}
@@ -115,6 +117,26 @@ export default function moa(pi: ExtensionAPI): void {
 			if (ctx.hasUI) ctx.ui.setWorkingMessage?.(message);
 		} catch {
 			// Display must never break a turn.
+		}
+	}
+
+	/** How advice records are shown (`ui.advice`); `collapsed` for unknown values. */
+	function adviceDisplay(): AdviceDisplay {
+		const value = loaded?.config.ui?.advice;
+		return value && (ADVICE_DISPLAY as readonly string[]).includes(value) ? value : "collapsed";
+	}
+
+	/** Rounds and consults in flight; the working message is restored when the last one ends. */
+	let activeRuns = 0;
+
+	/** Runs `run` with advisor progress in the working message (the latest run's k/n is shown). */
+	async function withProgress<T>(ctx: ExtensionContext, run: () => Promise<T>): Promise<T> {
+		activeRuns++;
+		try {
+			return await run();
+		} finally {
+			activeRuns = Math.max(0, activeRuns - 1);
+			if (activeRuns === 0) setWorking(ctx);
 		}
 	}
 
@@ -230,6 +252,7 @@ export default function moa(pi: ExtensionAPI): void {
 			complete: (model, context, options) => ctx.modelRegistry.streamSimple(model, context, options).result(),
 			...(record && { appendEntry: (type: string, data: unknown) => pi.appendEntry(type, data) }),
 			readPromptFile: (path) => (Object.hasOwn(config.promptFiles, path) ? config.promptFiles[path] : undefined),
+			onAdvisorDone: (done, total) => setWorking(ctx, progressText(done, total)),
 			debug,
 		};
 	}
@@ -263,22 +286,20 @@ export default function moa(pi: ExtensionAPI): void {
 			if (action === "stop") return undefined;
 			// Paused: no fresh round, but advice already paid for this turn is still reused.
 			if (decision.reason && action !== "pause") {
-				setWorking(ctx, "MoA: advisors…");
-				const round = await runRound(
-					roundInput(ctx, config, state.preset, event.messages, ctx.signal, {
-						reason: decision.reason,
-						turn: analysis.turnKey,
-						step: analysis.step,
-					}),
-					roundDeps(ctx, config, true),
-				)
-					.catch((error: unknown) => {
-						debug(`round failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`);
-						return undefined;
-					})
-					.finally(() => setWorking(ctx));
+				const input = roundInput(ctx, config, state.preset, event.messages, ctx.signal, {
+					reason: decision.reason,
+					turn: analysis.turnKey,
+					step: analysis.step,
+				});
+				const round = await withProgress(ctx, () => runRound(input, roundDeps(ctx, config, true))).catch((error: unknown) => {
+					debug(`round failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`);
+					return undefined;
+				});
 				// Interrupted rounds are recorded with their partial usage and count too.
-				if (round) budget.add(round.record);
+				if (round) {
+					budget.add(round.record);
+					updateStatus(ctx);
+				}
 				// Without a round (preset unusable, failure) the turn's cached advice still applies.
 				if (round?.interrupted) return undefined;
 				if (round) storeRound(cache, analysis.step, round.results, decision);
@@ -334,18 +355,24 @@ export default function moa(pi: ExtensionAPI): void {
 					},
 					run: async ({ messages, question, turn, step }) => {
 						if (!config || !presetName) return undefined;
-						const round = await runRound(
-							roundInput(ctx, config, presetName, messages, signal ?? ctx.signal, { reason: "consult", question, turn, step }),
-							roundDeps(ctx, config, false),
-						);
-						if (round) budget.add(round.record);
+						const input = roundInput(ctx, config, presetName, messages, signal ?? ctx.signal, { reason: "consult", question, turn, step });
+						const round = await withProgress(ctx, () => runRound(input, roundDeps(ctx, config, false)));
+						if (round) {
+							budget.add(round.record);
+							updateStatus(ctx);
+						}
 						return round;
 					},
 				},
 				onUpdate,
 			);
 		},
+		renderCall: (args, theme) => new Text(consultCallText(args.question, theme), 0, 0),
+		renderResult: (result, options, theme, context) => renderConsultResult(result, { ...options, isError: context?.isError }, adviceDisplay(), theme),
 	});
+
+	// Interactive mode only; HTML export skips custom entries.
+	pi.registerEntryRenderer(RECORD_ENTRY, (entry, options, theme) => renderEntry(entry.data, options.expanded, adviceDisplay(), theme));
 
 	pi.registerCommand("moa", {
 		description: "Mixture of Models: /moa [on [preset] | off | reload | init]",

@@ -160,6 +160,8 @@ export interface RoundDeps<M> {
 	now?: () => number;
 	/** See `RunOptions.abortGraceMs`. */
 	abortGraceMs?: number;
+	/** See `RunOptions.onAdvisorDone`. */
+	onAdvisorDone?: (done: number, total: number) => void;
 }
 
 /** Sanitises and caps a successful advisor's text, flagging what changed. */
@@ -215,7 +217,7 @@ export async function runRound<M extends ModelLike>(input: RoundInput<M>, deps: 
 			toolChoice: call.toolChoice,
 		};
 	});
-	const raw = await runAdvisors(requests, { complete: deps.complete, signal: input.signal, timeoutMs: preset.timeoutMs, now, abortGraceMs: deps.abortGraceMs });
+	const raw = await runAdvisors(requests, { complete: deps.complete, signal: input.signal, timeoutMs: preset.timeoutMs, now, abortGraceMs: deps.abortGraceMs, onAdvisorDone: deps.onAdvisorDone });
 	const results = raw.map(cleanResult);
 
 	const interrupted = input.signal?.aborted === true;

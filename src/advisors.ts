@@ -62,6 +62,8 @@ export interface RunOptions<M> {
 	 * usage pi reports on an aborted message is still recorded. Default 1000.
 	 */
 	abortGraceMs?: number;
+	/** Called with 0 at the start and as each advisor finishes, with the number done so far; errors are ignored. */
+	onAdvisorDone?: (done: number, total: number) => void;
 }
 
 const ABORT_GRACE_MS = 1000;
@@ -71,7 +73,23 @@ export async function runAdvisors<M extends ModelLike>(
 	advisors: readonly AdvisorRequest<M>[],
 	options: RunOptions<M>,
 ): Promise<AdvisorResult[]> {
-	const settled = await Promise.allSettled(advisors.map((advisor) => runAdvisor(advisor, options)));
+	let done = 0;
+	const report = () => {
+		try {
+			options.onAdvisorDone?.(done, advisors.length);
+		} catch {
+			// Progress display must never affect the round.
+		}
+	};
+	report();
+	const settled = await Promise.allSettled(
+		advisors.map((advisor) =>
+			runAdvisor(advisor, options).finally(() => {
+				done++;
+				report();
+			}),
+		),
+	);
 	return settled.map((outcome, i) =>
 		outcome.status === "fulfilled" ? outcome.value : failure(advisors[i]!, errorText(outcome.reason), 0),
 	);

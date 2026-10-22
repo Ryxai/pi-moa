@@ -2,14 +2,14 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Context } from "@earendil-works/pi-ai";
-import { afterAll, beforeEach, describe, expect, it } from "vitest";
-import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
+import type { EntryRenderer, ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import moa from "../src/index.ts";
 import { STALE_NOTE } from "../src/framing.ts";
 import { RECORD_ENTRY, type MoaRecord } from "../src/round.ts";
 import { STATE_ENTRY, type EntryLike } from "../src/state.ts";
 import { ADVICE_REQUEST } from "../src/view.ts";
-import { assistant, system, text, toolResult, user, usage } from "./fixtures.ts";
+import { assistant, fakeTheme, system, text, toolResult, user, usage } from "./fixtures.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 type Note = { message: string; type: string };
@@ -30,6 +30,7 @@ interface Harness {
 	piState: { blockImages: boolean; thinking: string };
 	/** Registered tools by name, the active set, and every `setActiveTools` call. */
 	tools: { registered: Map<string, ToolDefinition>; active: string[]; sets: string[][] };
+	entryRenderers: Map<string, EntryRenderer>;
 }
 
 const model = { provider: "anthropic", id: "sonnet" };
@@ -50,6 +51,7 @@ async function setup(): Promise<Harness> {
 	const working: (string | undefined)[] = [];
 	const piState = { blockImages: false, thinking: "medium" };
 	let command: { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> } | undefined;
+	const entryRenderers = new Map<string, EntryRenderer>();
 	const tools = { registered: new Map<string, ToolDefinition>(), active: ["read", "bash", "edit", "write"], sets: [] as string[][] };
 	const pi = {
 		registerTool: (tool: ToolDefinition) => {
@@ -68,6 +70,7 @@ async function setup(): Promise<Harness> {
 		appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", customType, data }),
 		getSettings: () => ({ images: { blockImages: piState.blockImages }, thinkingBudgets: { low: 3000 } }),
 		getThinkingLevel: () => piState.thinking,
+		registerEntryRenderer: (customType: string, renderer: EntryRenderer) => entryRenderers.set(customType, renderer),
 	};
 	moa(pi as unknown as ExtensionAPI);
 	const ctx = {
@@ -106,6 +109,7 @@ async function setup(): Promise<Harness> {
 		working,
 		piState,
 		tools,
+		entryRenderers,
 	};
 }
 
@@ -259,7 +263,7 @@ describe("context_with_system", () => {
 		expect(JSON.stringify(advice.content)).toContain("Advisor A (advisor):\\nCheck the failing test first.");
 		expect(records()).toHaveLength(1);
 		expect(records()[0]?.advisors[0]?.ok).toBe(true);
-		expect(h.working).toEqual(["MoA: advisors…", undefined]);
+		expect(h.working).toEqual(["MoA: advisors 0/1…", "MoA: advisors 1/1…", undefined]);
 	});
 
 	it("returns undefined when every advisor fails", async () => {
@@ -902,7 +906,7 @@ describe("advisor budget", () => {
 		expect(out.content).toEqual([text(expect.stringContaining("advisor budget reached for this session; consult is paused"))]);
 		expect(calls()).toBe(2);
 		expect(budgetNotes()).toHaveLength(1);
-		expect(h.status.get("moa")).toBe("moa:solo");
+		expect(h.status.get("moa")).toBe("moa:solo · $0.0400 · budget reached");
 	});
 
 	it("stop: turns MoA off through the persisted state and notifies", async () => {
@@ -953,5 +957,102 @@ describe("advisor output cleaning", () => {
 		const record = h.entries.find((e) => e.customType === RECORD_ENTRY)!.data as MoaRecord;
 		expect(record.advisors[0]).toMatchObject({ ok: true, sanitized: true, text: "Read the file.\n[removed tool-call-like text]" });
 		expect(record.advisors[0]).not.toHaveProperty("truncated");
+	});
+});
+
+describe("UI", () => {
+	const transcript = (prompt = "Fix the test", ts = 100) => [system("You are pi."), user(prompt, ts)];
+	const round = (ts = 100) => h.emit("context_with_system", { type: "context_with_system", messages: transcript("Fix the test", ts) });
+	const consult = () => h.tools.registered.get("consult")!.execute("t1", { question: "Sound?" }, undefined, undefined, h.ctx as never);
+	const theme = fakeTheme as never;
+	const render = (c: { render(width: number): string[] } | undefined) => c?.render(100).join("\n");
+	beforeEach(() => {
+		h.llm.reply = async () => assistant([text("Check the failing test first.")], { usage: usage(0.02) });
+	});
+
+	it("registers an entry renderer for moa records that honours ui.advice", async () => {
+		await h.run("on");
+		await round();
+		const entry = h.entries.find((e) => e.customType === RECORD_ENTRY)!;
+		const renderer = h.entryRenderers.get(RECORD_ENTRY)!;
+		const draw = (expanded: boolean) => render(renderer(entry as never, { expanded }, theme));
+		expect(draw(false)).toContain("1/1 advisor");
+		expect(draw(false)).not.toContain("Check the failing test");
+		expect(draw(true)).toContain("Check the failing test");
+		await writeGlobal(h, { ui: { advice: "hidden" } });
+		await h.run("reload");
+		expect(renderer(entry as never, { expanded: true }, theme)).toBeUndefined();
+		await writeGlobal(h, { ui: { advice: "expanded" } });
+		await h.run("reload");
+		expect(draw(false)).toContain("Check the failing test");
+	});
+
+	it("gives consult a call and result renderer using the record in details", async () => {
+		await h.run("on");
+		await round();
+		const tool = h.tools.registered.get("consult")!;
+		const out = await consult();
+		expect(out.content).toEqual([text(expect.stringContaining("Check the failing test first."))]);
+		expect(render(tool.renderCall!({ question: "Sound?" }, theme, {} as never))).toContain('"Sound?"');
+		const card = render(tool.renderResult!(out, { expanded: false, isPartial: false }, theme, { isError: false } as never));
+		expect(card).toContain("consult");
+		expect(card).not.toContain("Check the failing test");
+	});
+
+	it("shows spend in the status line after rounds and consults, and on restore", async () => {
+		await h.run("on");
+		expect(h.status.get("moa")).toBe("moa:solo");
+		await round();
+		expect(h.status.get("moa")).toBe("moa:solo · $0.0200");
+		await consult();
+		expect(h.status.get("moa")).toBe("moa:solo · $0.0400");
+		await h.emit("session_start");
+		expect(h.status.get("moa")).toBe("moa:solo · $0.0200");
+		await writeGlobal(h, { ui: { status: false } });
+		await h.run("reload");
+		expect(h.status.get("moa")).toBeUndefined();
+	});
+
+	it("shows consult progress and restores the working message", async () => {
+		await h.run("on");
+		await round();
+		h.working.length = 0;
+		await consult();
+		expect(h.working).toEqual(["MoA: advisors 0/1…", "MoA: advisors 1/1…", undefined]);
+	});
+
+	it("restores the working message only when the last of overlapping consults ends", async () => {
+		await writeGlobal(h, { presets: { solo: { consult: { maxPerTurn: 5 } } } });
+		await h.run("reload");
+		await h.run("on");
+		await round();
+		const gates: (() => void)[] = [];
+		h.llm.reply = () => new Promise((resolve) => gates.push(() => resolve(assistant([text("ok")], { usage: usage(0.02) }))));
+		h.working.length = 0;
+		const first = consult();
+		const second = consult();
+		await vi.waitFor(() => expect(gates).toHaveLength(2));
+		gates[0]!();
+		await first;
+		expect(h.working).toEqual(["MoA: advisors 0/1…", "MoA: advisors 0/1…", "MoA: advisors 1/1…"]);
+		gates[1]!();
+		await second;
+		expect(h.working.slice(3)).toEqual(["MoA: advisors 1/1…", undefined]);
+	});
+
+	it("never fails a round or consult when the UI is missing or throws", async () => {
+		await h.run("on");
+		Object.assign(h.ctx.ui, {
+			setWorkingMessage: () => {
+				throw new Error("stale ctx");
+			},
+			setStatus: () => {
+				throw new Error("stale ctx");
+			},
+		});
+		expect(await round()).toBeDefined();
+		expect((await consult()).isError).toBeUndefined();
+		Object.assign(h.ctx, { hasUI: false });
+		expect(await round(200)).toBeDefined();
 	});
 });

@@ -23,6 +23,27 @@ afterEach(() => {
 });
 
 describe("runAdvisors", () => {
+	it("reports progress as each advisor finishes, in finishing order, ignoring callback errors", async () => {
+		const gates = new Map<string, () => void>();
+		const complete: CompleteFn<ModelLike> = (model) => new Promise((resolve) => gates.set(model.id, () => resolve(reply(model.id))));
+		const progress: [number, number][] = [];
+		const run = runAdvisors([request("A", gpt), request("B", sonnet)], {
+			complete,
+			timeoutMs: 1000,
+			onAdvisorDone: (done, total) => {
+				progress.push([done, total]);
+				throw new Error("display broke");
+			},
+		});
+		await vi.waitFor(() => expect(gates.size).toBe(2));
+		gates.get("sonnet")!();
+		await vi.waitFor(() => expect(progress).toEqual([[0, 2], [1, 2]]));
+		gates.get("gpt")!();
+		const results = await run;
+		expect(progress).toEqual([[0, 2], [1, 2], [2, 2]]);
+		expect(results.map((r) => r.ok)).toEqual([true, true]);
+	});
+
 	it("returns text, usage, cost and latency on success", async () => {
 		let clock = 100;
 		const complete: CompleteFn<ModelLike> = async () => {

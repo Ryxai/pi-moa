@@ -222,10 +222,14 @@ built-in `solo` preset is used; `/moa init` writes it out.
 
 - `/moa`: status (on/off, preset, triggers, advisor spend this session).
 - `/moa on [preset]`, `/moa off`, `/moa <prompt>`, `/moa init`, `/moa reload`.
-- **Status line:** `moa:solo · $0.04`, plus live "advisors k/n" during a round.
+- **Status line:** `moa:solo · $0.04` (`· budget reached` once over). Live "advisors k/n" during a round
+  goes in pi's working message instead (`setWorkingMessage`), which pi already shows while waiting.
 - **Entry renderer** for `moa` records: one collapsed card per round. It expands to each advisor's text, with
   model, role, tokens, cost and latency.
 - All display code is wrapped so it can never break a turn.
+- `ui.advice: "hidden"` hides round entries; `consult` rows cannot be hidden, so they show the card line
+  only. Budget-skipped rounds write no record, so there is no card for them; a budget-gated `consult`
+  shows its result text.
 
 ## Files
 
@@ -254,7 +258,7 @@ moa/
     cache.ts          before_provider_request marker fix
     consult.ts        the consult tool (tool-names.ts: its name)
     debug.ts          PI_MOA_DEBUG log
-    render.ts         entry renderer and status line (planned)
+    render.ts         entry and consult renderers, status line, progress text
   test/               vitest unit tests
 ```
 

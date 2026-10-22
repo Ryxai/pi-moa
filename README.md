@@ -123,7 +123,23 @@ costs are unknown. Before a round or consult, once spend ≥ `sessionUsd`:
 ends the provider request in pi; its aborted reply (which carries the usage reported so far) is
 awaited for up to a second so that usage is recorded.
 
-The advice renderer, `moa/<preset>` virtual models and one-shot `/moa <prompt>` are planned.
+**Display:** each round's `moa` entry shows as one line in the transcript, e.g.
+`◇ MoA · user_turn · step 2 · 2/2 advisors · $0.0120 · 4.1s` (the advisor count turns warning/error
+coloured when advisors fail, `cost ?`/`+?` for unreported cost, `interrupted` for aborted rounds). Expanding tool output (pi's
+expand toggle, e.g. Ctrl+O) shows each advisor's label (anonymised as recorded), model, role, tokens
+in/out (with cached input), cost, latency, flags (`retried`, `sanitized`, `truncated`) or error, and
+its advice as markdown (code blocks highlighted as in pi's own messages). `consult` calls show as `consult "question…"` with the same card as the
+result (the actor still gets the plain framed advice); calls that ran no round (limit, budget,
+unavailable) show their result text. `ui.advice`: `"collapsed"` (default; follows the expand
+toggle), `"expanded"` (always), `"hidden"` (no round entries; consult results show the card line
+only). The footer status is `moa:<preset> · $<spend>` (spend omitted at $0, `· budget reached` once
+`budget.sessionUsd` is reached), cleared when off and not shown with `ui.status: false`. While
+advisors run, pi's working message reads `MoA: advisors k/n…` (the latest of any overlapping rounds and
+consults; the default returns when the last one ends). Round entries are shown in
+interactive mode only: pi's HTML export skips custom entries (consult results are exported with
+their card, collapsed and expanded), and print/JSON/RPC modes do not render them.
+
+`moa/<preset>` virtual models and one-shot `/moa <prompt>` are planned.
 
 **Prompt caching:** the advice changes every request, so MoA moves the conversation cache marker
 (Anthropic `cache_control`, `cache_control` on OpenRouter `anthropic/*` chat completions, Bedrock

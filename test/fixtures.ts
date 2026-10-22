@@ -33,3 +33,23 @@ export const text = (t: string) => ({ type: "text" as const, text: t });
 export function toolResult(toolName: string, body: string, isError = false, timestamp = 3): ToolResultMessage {
 	return { role: "toolResult", toolCallId: "c1", toolName, content: [text(body)], isError, timestamp };
 }
+
+/** A theme that tags styled text, e.g. `<muted>x</muted>`; satisfies the renderers' `ThemeLike` plus `bg`. */
+export const fakeTheme = {
+	fg: (color: string, t: string) => `<${color}>${t}</${color}>`,
+	bg: (color: string, t: string) => `<bg:${color}>${t}</bg:${color}>`,
+	bold: (t: string) => `<b>${t}</b>`,
+	italic: (t: string) => `<i>${t}</i>`,
+	underline: (t: string) => `<u>${t}</u>`,
+	strikethrough: (t: string) => `<s>${t}</s>`,
+};
+
+/** A theme with no styling. */
+export const plainTheme = {
+	fg: (_c: string, t: string) => t,
+	bg: (_c: string, t: string) => t,
+	bold: (t: string) => t,
+	italic: (t: string) => t,
+	underline: (t: string) => t,
+	strikethrough: (t: string) => t,
+};
