@@ -1,0 +1,34 @@
+import { isPlainObject } from "./schema.ts";
+
+export const STATE_ENTRY = "moa-state";
+
+export interface MoaState {
+	enabled: boolean;
+	preset?: string;
+}
+
+export const OFF: MoaState = { enabled: false };
+
+/** Minimal shape of a session entry; pi's `SessionEntry` satisfies it. */
+export interface EntryLike {
+	type: string;
+	customType?: string;
+	data?: unknown;
+}
+
+/** Latest valid `moa-state` entry on the branch wins; no entry means off. */
+export function reconstructState(branch: readonly EntryLike[]): MoaState {
+	for (let i = branch.length - 1; i >= 0; i--) {
+		const entry = branch[i];
+		if (entry?.type !== "custom" || entry.customType !== STATE_ENTRY) continue;
+		const state = toState(entry.data);
+		if (state) return state;
+	}
+	return OFF;
+}
+
+function toState(data: unknown): MoaState | undefined {
+	if (!isPlainObject(data) || typeof data.enabled !== "boolean") return undefined;
+	if (!data.enabled) return OFF;
+	return typeof data.preset === "string" ? { enabled: true, preset: data.preset } : undefined;
+}
