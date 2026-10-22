@@ -5,6 +5,7 @@ import { CONFIG_FILE, loadConfig, writeDefaultConfig, type LoadedConfig } from "
 import { resolvePreset } from "./config-resolve.ts";
 import { formatIssues, getPreset, issuesFor } from "./config.ts";
 import { createDebugLog, debugLogPath } from "./debug.ts";
+import { runRound } from "./round.ts";
 import { OFF, reconstructState, STATE_ENTRY, type MoaState } from "./state.ts";
 
 export default function moa(pi: ExtensionAPI): void {
@@ -48,10 +49,17 @@ export default function moa(pi: ExtensionAPI): void {
 	}
 
 	function updateStatus(ctx: ExtensionContext): void {
-		if (!ctx.hasUI) return;
 		const show = state.enabled && (loaded?.config.ui.status ?? true);
 		try {
-			ctx.ui.setStatus("moa", show ? `moa:${state.preset}` : undefined);
+			if (ctx.hasUI) ctx.ui.setStatus("moa", show ? `moa:${state.preset}` : undefined);
+		} catch {
+			// Display must never break a turn.
+		}
+	}
+
+	function setWorking(ctx: ExtensionContext, message?: string): void {
+		try {
+			if (ctx.hasUI) ctx.ui.setWorkingMessage?.(message);
 		} catch {
 			// Display must never break a turn.
 		}
@@ -84,13 +92,32 @@ export default function moa(pi: ExtensionAPI): void {
 	pi.on("session_start", (_event, ctx) => restore(ctx));
 	pi.on("session_tree", (_event, ctx) => restore(ctx));
 
-	pi.on("context_with_system", (event) => {
+	pi.on("context_with_system", async (event, ctx) => {
 		contextCalls++;
 		const last = event.messages.at(-1);
 		debug(
 			`context_with_system #${contextCalls} enabled=${state.enabled} preset=${state.preset ?? "-"} messages=${event.messages.length} last=${last?.role}`,
 		);
-		// Pass-through for now: advice injection arrives in step 2.
+		if (!state.enabled || !state.preset || !loaded) return undefined;
+		const config = loaded;
+		setWorking(ctx, "MoA: advisors…");
+		try {
+			const messages = await runRound(
+				{ messages: event.messages, config: config.config, presetName: state.preset, models: ctx.modelRegistry, actor: ctx.model, signal: ctx.signal },
+				{
+					complete: (model, context, options) => ctx.modelRegistry.streamSimple(model, context, options).result(),
+					appendEntry: (type, data) => pi.appendEntry(type, data),
+					readPromptFile: (path) => (Object.hasOwn(config.promptFiles, path) ? config.promptFiles[path] : undefined),
+					debug,
+				},
+			);
+			return messages ? { messages } : undefined;
+		} catch (error) {
+			debug(`round failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`);
+			return undefined;
+		} finally {
+			setWorking(ctx);
+		}
 	});
 
 	pi.registerCommand("moa", {

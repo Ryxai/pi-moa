@@ -4,7 +4,9 @@ import { join } from "node:path";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import moa from "../src/index.ts";
+import { RECORD_ENTRY } from "../src/round.ts";
 import { STATE_ENTRY, type EntryLike } from "../src/state.ts";
+import { assistant, system, text, user } from "./fixtures.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 type Note = { message: string; type: string };
@@ -20,6 +22,8 @@ interface Harness {
 	emit(event: string, payload?: unknown): Promise<unknown>;
 	lastNote(): Note | undefined;
 	auth: { ok: boolean };
+	llm: { reply: (model: { id: string }) => Promise<unknown> };
+	working: (string | undefined)[];
 }
 
 const model = { provider: "anthropic", id: "sonnet" };
@@ -32,6 +36,8 @@ async function setup(): Promise<Harness> {
 	const status = new Map<string, string | undefined>();
 	const handlers = new Map<string, Handler>();
 	const auth = { ok: true };
+	const llm = { reply: async (_model: { id: string }): Promise<unknown> => assistant([text("Check the failing test first.")]) };
+	const working: (string | undefined)[] = [];
 	let command: { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> } | undefined;
 	const pi = {
 		on: (event: string, handler: Handler) => handlers.set(event, handler),
@@ -49,11 +55,13 @@ async function setup(): Promise<Harness> {
 		modelRegistry: {
 			find: (provider: string, id: string) => (provider === model.provider && id === model.id ? model : undefined),
 			hasConfiguredAuth: () => auth.ok,
+			streamSimple: (m: { id: string }) => ({ result: () => llm.reply(m) }),
 		},
 		sessionManager: { getBranch: () => entries },
 		ui: {
 			setStatus: (key: string, text: string | undefined) => status.set(key, text),
 			notify: (message: string, type = "info") => notes.push({ message, type }),
+			setWorkingMessage: (message?: string) => working.push(message),
 		},
 	} as unknown as ExtensionCommandContext;
 	return {
@@ -67,6 +75,8 @@ async function setup(): Promise<Harness> {
 		emit: async (event, payload = {}) => handlers.get(event)?.(payload, ctx),
 		lastNote: () => notes.at(-1),
 		auth,
+		llm,
+		working,
 	};
 }
 
@@ -191,16 +201,60 @@ describe("other commands and hooks", () => {
 		expect(h.lastNote()?.message).toContain("not implemented yet");
 	});
 
-	it("context_with_system passes through whether on or off", async () => {
-		const event = { type: "context_with_system", messages: [{ role: "user", content: "hi", timestamp: 1 }] };
-		expect(await h.emit("context_with_system", event)).toBeUndefined();
-		await h.run("on");
-		expect(await h.emit("context_with_system", event)).toBeUndefined();
-	});
-
 	it("status reports on with the preset", async () => {
 		await h.run("on");
 		await h.run("");
 		expect(h.lastNote()?.message).toMatch(/^MoA on · preset solo/);
+	});
+});
+
+describe("context_with_system", () => {
+	const event = () => ({ type: "context_with_system", messages: [system("You are pi."), user("Fix the test")] });
+	const records = () => h.entries.filter((e) => e.customType === RECORD_ENTRY).map((e) => e.data as { advisors: { ok: boolean }[] });
+
+	it("passes through while off", async () => {
+		expect(await h.emit("context_with_system", event())).toBeUndefined();
+		expect(records()).toEqual([]);
+		expect(h.working).toEqual([]);
+	});
+
+	it("appends advice as the last user message without touching the original", async () => {
+		await h.run("on");
+		const e = event();
+		const snapshot = structuredClone(e.messages);
+		const result = (await h.emit("context_with_system", e)) as { messages: { role: string; content: unknown }[] };
+		expect(e.messages).toEqual(snapshot);
+		expect(result.messages.slice(0, -1)).toEqual(snapshot);
+		const advice = result.messages.at(-1)!;
+		expect(advice.role).toBe("user");
+		expect(JSON.stringify(advice.content)).toContain("Advisor A (advisor):\\nCheck the failing test first.");
+		expect(records()).toHaveLength(1);
+		expect(records()[0]?.advisors[0]?.ok).toBe(true);
+		expect(h.working).toEqual(["MoA: advisors…", undefined]);
+	});
+
+	it("returns undefined when every advisor fails", async () => {
+		await h.run("on");
+		h.llm.reply = async () => assistant([], { stopReason: "error", errorMessage: "rate limited" });
+		expect(await h.emit("context_with_system", event())).toBeUndefined();
+		expect(records()[0]?.advisors[0]?.ok).toBe(false);
+	});
+
+	it("skips quietly when the preset no longer resolves", async () => {
+		await h.run("on");
+		h.auth.ok = false;
+		expect(await h.emit("context_with_system", event())).toBeUndefined();
+		expect(records()).toEqual([]);
+	});
+
+	it("returns undefined when the round throws", async () => {
+		await h.run("on");
+		Object.assign(h.ctx.modelRegistry, {
+			hasConfiguredAuth: () => {
+				throw new Error("boom");
+			},
+		});
+		expect(await h.emit("context_with_system", event())).toBeUndefined();
+		expect(h.working.at(-1)).toBeUndefined();
 	});
 });

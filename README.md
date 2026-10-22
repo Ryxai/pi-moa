@@ -4,9 +4,11 @@ Mixture of Models for the [pi](https://pi.dev) coding agent. Before your model (
 1–3 advisor models look at the conversation and give advice that the actor sees for that one request only.
 The design is in [PLAN.md](PLAN.md).
 
-**Status: early skeleton.** Config, `/moa on|off`, and session state work. Advisors, the `consult`
-tool, the cache-marker fix, the advice renderer, `moa/<preset>` virtual models and one-shot
-`/moa <prompt>` are planned.
+**Status: early.** Config, `/moa on|off` and session state work. While on, the preset's advisors
+run on **every** model request (triggers are not applied yet) with a text view of the transcript;
+their advice is added to that request only, and each round is saved as a `moa` session entry.
+Triggers, the `consult` tool, the cache-marker fix, the advice renderer, `moa/<preset>` virtual
+models and one-shot `/moa <prompt>` are planned.
 
 ## Install
 

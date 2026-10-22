@@ -40,6 +40,15 @@ describe("loadConfig", () => {
 		expect(loaded.notes[0]).toMatch(/not trusted/);
 	});
 
+	it("reads role prompt files relative to the config file and reports unreadable ones", async () => {
+		await mkdir(join(dir, "agent", "roles"));
+		await write(join(dir, "agent", "roles", "sec.md"), "Focus on security.");
+		await write(paths.global, { roles: { security: { promptFile: "./roles/sec.md" }, gone: { promptFile: "./roles/gone.md" } } });
+		const loaded = await loadConfig(paths);
+		expect(loaded.promptFiles).toEqual({ [join(dir, "agent", "roles", "sec.md")]: "Focus on security." });
+		expect(loaded.issues.map((i) => i.path)).toEqual(["roles.gone.promptFile"]);
+	});
+
 	it("reports invalid JSON as an issue", async () => {
 		await write(paths.global, "{ nope");
 		const loaded = await loadConfig(paths);

@@ -15,6 +15,8 @@ export interface LoadedConfig extends ParsedConfig {
 	/** Files that were read, lowest precedence first. */
 	sources: string[];
 	notes: string[];
+	/** Contents of every role `promptFile`, by absolute path. */
+	promptFiles: Record<string, string>;
 }
 
 export async function loadConfig(paths: ConfigPaths): Promise<LoadedConfig> {
@@ -37,7 +39,23 @@ export async function loadConfig(paths: ConfigPaths): Promise<LoadedConfig> {
 		notes.push(`ignoring ${paths.project}: project is not trusted`);
 	}
 	const parsed = parseConfig(layers);
-	return { ...parsed, issues: [...fileIssues, ...parsed.issues], sources, notes };
+	const promptFiles = await readPromptFiles(parsed.config.roles, fileIssues);
+	return { ...parsed, issues: [...fileIssues, ...parsed.issues], sources, notes, promptFiles };
+}
+
+async function readPromptFiles(roles: unknown, issues: ConfigIssue[]): Promise<Record<string, string>> {
+	const files: Record<string, string> = {};
+	if (!isPlainObject(roles)) return files;
+	for (const [name, role] of Object.entries(roles)) {
+		const file = isPlainObject(role) ? role.promptFile : undefined;
+		if (typeof file !== "string" || file === "" || Object.hasOwn(files, file)) continue;
+		try {
+			files[file] = await readFile(file, "utf8");
+		} catch (error) {
+			issues.push({ path: `roles.${name}.promptFile`, message: `cannot read ${file}: ${(error as Error).message}` });
+		}
+	}
+	return files;
 }
 
 async function exists(file: string): Promise<boolean> {
