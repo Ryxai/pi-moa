@@ -1,13 +1,15 @@
 import { join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { adviceText, cacheForTurn, decideRound, storeRound, type TurnCache } from "./advice-cache.ts";
 import { moveCacheMarker } from "./cache.ts";
 import { completeMoaArgs, parseMoaArgs } from "./commands.ts";
 import { CONFIG_FILE, loadConfig, writeDefaultConfig, type LoadedConfig } from "./config-io.ts";
 import { resolvePreset } from "./config-resolve.ts";
 import { formatIssues, getPreset, issuesFor } from "./config.ts";
 import { createDebugLog, debugLogPath } from "./debug.ts";
-import { runRound } from "./round.ts";
+import { appendAdvice, runRound } from "./round.ts";
 import { OFF, reconstructState, STATE_ENTRY, type MoaState } from "./state.ts";
+import { analyzeTurn } from "./triggers.ts";
 
 /** How many recent advice texts the cache-marker hook recognises. */
 const TRACKED_ADVICE = 3;
@@ -28,6 +30,8 @@ export default function moa(pi: ExtensionAPI): void {
 	 * rounds that produced no advice or were aborted.
 	 */
 	let injected: string[] = [];
+	/** Advice for the current turn, reused on steps where no trigger fires and on retries. */
+	let turnCache: TurnCache | undefined;
 
 	async function reload(ctx: ExtensionContext): Promise<LoadedConfig> {
 		loaded = await loadConfig({
@@ -88,6 +92,7 @@ export default function moa(pi: ExtensionAPI): void {
 	async function restore(ctx: ExtensionContext): Promise<void> {
 		contextCalls = 0;
 		injected = [];
+		turnCache = undefined;
 		const config = await reload(ctx);
 		for (const note of config.notes) notify(ctx, `MoA: ${note}`, "warning");
 		persisted = reconstructState(ctx.sessionManager.getBranch());
@@ -113,33 +118,54 @@ export default function moa(pi: ExtensionAPI): void {
 		);
 		if (!state.enabled || !state.preset || !loaded) return undefined;
 		const config = loaded;
-		setWorking(ctx, "MoA: advisors…");
+		const preset = getPreset(config.config, state.preset);
+		if (!preset) return undefined;
 		try {
-			const round = await runRound(
-				{
-					messages: event.messages,
-					config: config.config,
-					presetName: state.preset,
-					models: ctx.modelRegistry,
-					actor: ctx.model,
-					signal: ctx.signal,
-					sessionId: sessionIdOf(ctx),
-				},
-				{
-					complete: (model, context, options) => ctx.modelRegistry.streamSimple(model, context, options).result(),
-					appendEntry: (type, data) => pi.appendEntry(type, data),
-					readPromptFile: (path) => (Object.hasOwn(config.promptFiles, path) ? config.promptFiles[path] : undefined),
-					debug,
-				},
+			const analysis = analyzeTurn(event.messages);
+			const cache = cacheForTurn(turnCache, analysis);
+			turnCache = cache;
+			const decision = decideRound(cache, preset, analysis);
+			debug(
+				`turn step=${analysis.step} errors=${analysis.consecutiveErrors} repeats=${analysis.repeatedCalls} run=${decision.reason ?? "no"}`,
 			);
-			if (!round) return undefined;
-			injected = [...injected, round.advice].slice(-TRACKED_ADVICE);
-			return { messages: round.messages };
+			if (decision.reason) {
+				setWorking(ctx, "MoA: advisors…");
+				const round = await runRound(
+					{
+						messages: event.messages,
+						config: config.config,
+						presetName: state.preset,
+						models: ctx.modelRegistry,
+						actor: ctx.model,
+						signal: ctx.signal,
+						sessionId: sessionIdOf(ctx),
+						reason: decision.reason,
+						turn: analysis.turnKey,
+						step: analysis.step,
+					},
+					{
+						complete: (model, context, options) => ctx.modelRegistry.streamSimple(model, context, options).result(),
+						appendEntry: (type, data) => pi.appendEntry(type, data),
+						readPromptFile: (path) => (Object.hasOwn(config.promptFiles, path) ? config.promptFiles[path] : undefined),
+						debug,
+					},
+				)
+					.catch((error: unknown) => {
+						debug(`round failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`);
+						return undefined;
+					})
+					.finally(() => setWorking(ctx));
+				// Without a round (preset unusable, failure) the turn's cached advice still applies.
+				if (round?.interrupted) return undefined;
+				if (round) storeRound(cache, analysis.step, round.results, decision);
+			}
+			const text = adviceText(cache, analysis);
+			if (!text) return undefined;
+			if (injected.at(-1) !== text) injected = [...injected.filter((t) => t !== text), text].slice(-TRACKED_ADVICE);
+			return { messages: appendAdvice(event.messages, text, Date.now()) };
 		} catch (error) {
-			debug(`round failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`);
+			debug(`advice failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`);
 			return undefined;
-		} finally {
-			setWorking(ctx);
 		}
 	});
 

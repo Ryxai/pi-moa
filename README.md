@@ -5,10 +5,28 @@ Mixture of Models for the [pi](https://pi.dev) coding agent. Before your model (
 The design is in [PLAN.md](PLAN.md).
 
 **Status: early.** Config, `/moa on|off` and session state work. While on, the preset's advisors
-run on **every** model request (triggers are not applied yet) with a text view of the transcript;
-their advice is added to that request only, and each round is saved as a `moa` session entry.
-Triggers, the `consult` tool, the advice renderer, `moa/<preset>` virtual models and one-shot
-`/moa <prompt>` are planned.
+run when one of its triggers fires, with a text view of the transcript; their advice is added to
+that request only, and each fresh round is saved as a `moa` session entry with its trigger.
+
+**Triggers** (per preset, default `["user_turn", "on_failure"]`):
+- `user_turn`: the first request after a user message (including steering and follow-up messages;
+  messages other extensions add with `sendMessage` do not start a new turn);
+- `every_step`: every request;
+- `{ "every_n": N }`: the first request of the turn and every Nth step after it;
+- `on_failure`: a streak of `onFailure.consecutiveErrors` failed tool results in a row, or of the
+  same tool call (name and arguments) `onFailure.repeatedCalls` times in a row, within the turn —
+  when a streak first reaches N, and again at every further N.
+
+On steps where nothing fires, the turn's latest advice is reused, with a note that it predates the
+newest tool results; with no advice yet this turn, the request goes out without any. A retried
+request for a step that already had a round reuses it instead of calling the advisors again, and
+interrupted rounds are discarded. If a round cannot run, the turn's earlier advice is used. If
+compaction summarises away the turn's user message mid-turn, the turn's advice is kept and always
+marked stale; `on_failure` and `every_step` keep working, and `every_n` counts steps from the
+summary.
+
+The `consult` tool, the advice renderer, `moa/<preset>` virtual models and one-shot `/moa <prompt>`
+are planned.
 
 **Prompt caching:** the advice changes every request, so MoA moves the conversation cache marker
 (Anthropic `cache_control`, `cache_control` on OpenRouter `anthropic/*` chat completions, Bedrock

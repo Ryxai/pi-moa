@@ -34,12 +34,15 @@ The actor answers, calls tools and is saved as usual.
 ## Per-request flow (`context_with_system`)
 
 1. **Active?** Skip unless MoA is on for this session or a `moa/*` model is selected.
-2. **Where are we?** From the transcript: the last real `user` message (turn key = its timestamp), the number of
+2. **Where are we?** From the transcript: the last real `user` message (turn key = its timestamp + a content hash), the number of
    assistant steps since then, consecutive `toolResult.isError`, and repeated identical tool calls
    (`name + JSON args` fingerprint).
 3. **Should advisors run?** Run if any trigger fires: `user_turn` (step 0), `every_step`, `{every_n: N}`
-   (step 0 and every Nth), `on_failure` (N errors in a row or N repeated calls). Otherwise reuse cached advice
-   for this turn, with the stale note when tool activity has happened since. No cache → no advice this step.
+   (step 0 and every Nth), `on_failure` (a streak of N errors in a row or N repeated calls, when it first reaches
+   N and at every further N). A step that already had a round (a retry) never runs again. Otherwise reuse cached
+   advice for this turn, with the stale note when tool results arrived after the step it was made for. No cache →
+   no advice this step. If compaction removes the turn's user message, the turn key becomes the summary and the
+   advice is kept, always stale.
 4. **Budget check.** If the session spend is over `budget.sessionUsd`, apply `onExceed`: `warn`, `pause`
    (actor alone) or `stop` (turn MoA off).
 5. **Build each advisor's view** (see Context).
@@ -47,8 +50,8 @@ The actor answers, calls tools and is saved as usual.
    per-advisor timeout and `maxTokens`. Use `Promise.allSettled`; continue without failed or late advisors.
    Live status shows "MoA: 1/2 advisors…".
 7. **Clean the output.** Strip lines that look like tool calls or transcript markers (`[called tool:`,
-   `[tool result:`, tool-call-shaped JSON). Cache the cleaned advice under (turn key, step), unless the run was
-   interrupted.
+   `[tool result:`, tool-call-shaped JSON). Cache it as the turn's latest advice, with the
+   last run step and the failure streaks it fired on, unless the run was interrupted.
 8. **Record** with `pi.appendEntry("moa", …)`: preset, trigger, step, and per advisor the model, role, text,
    usage, cost, latency and error.
 9. **Inject** one trailing user message (see Framing) and return the messages.

@@ -4,9 +4,10 @@ import { join } from "node:path";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import moa from "../src/index.ts";
-import { RECORD_ENTRY } from "../src/round.ts";
+import { STALE_NOTE } from "../src/framing.ts";
+import { RECORD_ENTRY, type MoaRecord } from "../src/round.ts";
 import { STATE_ENTRY, type EntryLike } from "../src/state.ts";
-import { assistant, system, text, user } from "./fixtures.ts";
+import { assistant, system, text, toolResult, user } from "./fixtures.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 type Note = { message: string; type: string };
@@ -267,7 +268,9 @@ describe("context_with_system", () => {
 
 describe("before_provider_request (cache marker)", () => {
 	const CC = { type: "ephemeral" };
-	const event = () => ({ type: "context_with_system", messages: [system("You are pi."), user("Fix the test")] });
+	/** Each call is a new user turn, so advisors run fresh. */
+	let turn = 0;
+	const event = () => ({ type: "context_with_system", messages: [system("You are pi."), user("Fix the test", ++turn)] });
 	/** An Anthropic payload as pi would build it for `messages`, marker on the last block. */
 	const payloadFor = (adviceText: string) => ({
 		model: "claude",
@@ -354,5 +357,190 @@ describe("before_provider_request (cache marker)", () => {
 		const options = h.llm.options.at(-1) as { sessionId?: string; onPayload?: unknown };
 		expect(options.sessionId).toBe("moa0-session-1");
 		expect(options.onPayload).toBeTypeOf("function");
+	});
+});
+
+describe("triggers and the advice cache", () => {
+	type Out = { messages: { role: string; content: { text: string }[] }[] } | undefined;
+	const records = () => h.entries.filter((e) => e.customType === RECORD_ENTRY).map((e) => e.data as MoaRecord);
+	const calls = () => h.llm.options.length;
+	const adviceOf = (out: unknown) => (out as Out)?.messages.at(-1)?.content[0]?.text;
+	/** The transcript after `results.length` tool steps of the turn started by `prompt`; true = errored. */
+	const transcript = (results: boolean[], prompt = "Fix the test", ts = 100) => [
+		system("You are pi."),
+		user(prompt, ts),
+		...results.flatMap((isError, i) => [
+			assistant([{ type: "toolCall" as const, id: `c${i}`, name: "bash", arguments: { command: `step ${i}` } }], { stopReason: "toolUse" }),
+			{ ...toolResult("bash", isError ? "failed" : "ok", isError), toolCallId: `c${i}` },
+		]),
+	];
+	const step = async (messages: unknown[]) => adviceOf(await h.emit("context_with_system", { type: "context_with_system", messages }));
+	const usePreset = async (preset: Record<string, unknown>) => {
+		await writeGlobal(h, { presets: { solo: preset } });
+		await h.run("reload");
+		await h.run("on");
+	};
+	let n = 0;
+	beforeEach(() => {
+		n = 0;
+		h.llm.reply = async () => assistant([text(`advice ${++n}`)]);
+	});
+
+	it("user_turn runs once, then reuses the advice with the stale note after tool activity", async () => {
+		await h.run("on");
+		const first = await step(transcript([]));
+		expect(first).toContain("advice 1");
+		expect(first).not.toContain(STALE_NOTE);
+		const later = await step(transcript([false, false]));
+		expect(later).toContain("advice 1");
+		expect(later).toContain(STALE_NOTE);
+		expect(calls()).toBe(1);
+		expect(records().map((r) => [r.reason, r.step])).toEqual([["user_turn", 0]]);
+	});
+
+	it("every_n runs at step 0 and every Nth step and reuses in between", async () => {
+		await usePreset({ triggers: [{ every_n: 2 }] });
+		const texts = [];
+		for (let i = 0; i <= 4; i++) texts.push(await step(transcript(Array(i).fill(false))));
+		expect(calls()).toBe(3);
+		expect(records().map((r) => [r.reason, r.step])).toEqual([["every_n", 0], ["every_n", 2], ["every_n", 4]]);
+		expect(texts[1]).toContain("advice 1");
+		expect(texts[3]).toContain("advice 2");
+		expect(texts[3]).toContain(STALE_NOTE);
+		expect(texts[4]).not.toContain(STALE_NOTE);
+	});
+
+	it("with only on_failure, gives no advice until N errors in a row", async () => {
+		await usePreset({ triggers: ["on_failure"], onFailure: { consecutiveErrors: 2, repeatedCalls: 3 } });
+		expect(await step(transcript([]))).toBeUndefined();
+		expect(await step(transcript([true]))).toBeUndefined();
+		expect(calls()).toBe(0);
+		expect(await step(transcript([true, true]))).toContain("advice 1");
+		expect(records().map((r) => [r.reason, r.step])).toEqual([["on_failure", 2]]);
+		const after = await step(transcript([true, true, false]));
+		expect(after).toContain("advice 1");
+		expect(after).toContain(STALE_NOTE);
+		expect(calls()).toBe(1);
+	});
+
+	it("an interrupted on_failure round fires again on the next step", async () => {
+		await usePreset({ triggers: ["on_failure"], onFailure: { consecutiveErrors: 2, repeatedCalls: 9 } });
+		const controller = new AbortController();
+		Object.assign(h.ctx, { signal: controller.signal });
+		h.llm.reply = async () => {
+			controller.abort();
+			return assistant([text("too late")]);
+		};
+		expect(await step(transcript([true, true]))).toBeUndefined();
+		Object.assign(h.ctx, { signal: undefined });
+		h.llm.reply = async () => assistant([text("fresh")]);
+		expect(await step(transcript([true, true, true]))).toContain("fresh");
+		expect(await step(transcript([true, true, true, true]))).toContain(STALE_NOTE);
+		expect(records().map((r) => [r.step, r.interrupted ?? false])).toEqual([[2, true], [3, false]]);
+	});
+
+	it("keeps the turn's advice, marked stale, after compaction removes the user message", async () => {
+		await h.run("on");
+		expect(await step(transcript([]))).toContain("advice 1");
+		const compacted = [
+			system("You are pi."),
+			{ role: "compactionSummary", summary: "Fixing the test.", tokensBefore: 5000, timestamp: 150 },
+			...transcript([false]).slice(2),
+		];
+		const out = await step(compacted);
+		expect(out).toContain("advice 1");
+		expect(out).toContain(STALE_NOTE);
+		expect(calls()).toBe(1);
+	});
+
+	it("falls back to the turn's advice when a round cannot run", async () => {
+		await usePreset({ triggers: ["user_turn", "every_step"] });
+		await step(transcript([]));
+		h.auth.ok = false;
+		const out = await step(transcript([false]));
+		expect(out).toContain("advice 1");
+		expect(out).toContain(STALE_NOTE);
+	});
+
+	it("on_failure fires on repeated identical calls", async () => {
+		await usePreset({ triggers: ["on_failure"], onFailure: { consecutiveErrors: 9, repeatedCalls: 2 } });
+		const same = assistant([{ type: "toolCall", id: "x", name: "read", arguments: { path: "a", limit: 5 } }], { stopReason: "toolUse" });
+		const reordered = assistant([{ type: "toolCall", id: "y", name: "read", arguments: { limit: 5, path: "a" } }], { stopReason: "toolUse" });
+		expect(await step([...transcript([]), same, toolResult("read", "ok")])).toBeUndefined();
+		expect(await step([...transcript([]), same, toolResult("read", "ok"), reordered, toolResult("read", "ok")])).toContain("advice 1");
+		expect(records()[0]).toMatchObject({ reason: "on_failure", step: 2 });
+	});
+
+	it("a retried request for the same step reuses the advice without calling advisors", async () => {
+		await h.run("on");
+		const first = await step(transcript([]));
+		expect(await step(transcript([]))).toBe(first);
+		// A retry after an error response (pi omits it; skipped even when present).
+		const failed = assistant([text("partial")], { stopReason: "error", errorMessage: "overloaded" });
+		expect(await step([...transcript([]), failed])).toBe(first);
+		expect(calls()).toBe(1);
+		expect(records()).toHaveLength(1);
+	});
+
+	it("a retried step that produced no advice is not re-run", async () => {
+		await h.run("on");
+		h.llm.reply = async () => assistant([], { stopReason: "error", errorMessage: "rate limited" });
+		expect(await step(transcript([]))).toBeUndefined();
+		expect(await step(transcript([]))).toBeUndefined();
+		expect(calls()).toBe(1);
+	});
+
+	it("never caches an interrupted round", async () => {
+		await h.run("on");
+		const controller = new AbortController();
+		Object.assign(h.ctx, { signal: controller.signal });
+		h.llm.reply = async () => {
+			controller.abort();
+			return assistant([text("too late")]);
+		};
+		expect(await step(transcript([]))).toBeUndefined();
+		expect(records()[0]).toMatchObject({ reason: "user_turn", interrupted: true });
+		Object.assign(h.ctx, { signal: undefined });
+		h.llm.reply = async () => assistant([text("fresh")]);
+		expect(await step(transcript([]))).toContain("fresh");
+		expect(calls()).toBe(2);
+		expect(records()).toHaveLength(2);
+	});
+
+	it("a new user message (including steering) starts a fresh round", async () => {
+		await h.run("on");
+		await step(transcript([]));
+		expect(calls()).toBe(1);
+		const steered = [...transcript([false]), user("Actually, use the other file", 200)];
+		const out = await step(steered);
+		expect(out).toContain("advice 2");
+		expect(out).not.toContain(STALE_NOTE);
+		expect(await step(transcript([], "Next task", 300))).toContain("advice 3");
+		expect(records().map((r) => r.turn)).toEqual([expect.stringMatching(/^100:/), expect.stringMatching(/^200:/), expect.stringMatching(/^300:/)]);
+	});
+
+	it("clears the cache on session change", async () => {
+		await h.run("on");
+		await step(transcript([]));
+		expect(await step(transcript([false]))).toContain("advice 1");
+		await h.emit("session_tree");
+		expect(await step(transcript([false]))).toBeUndefined();
+		expect(calls()).toBe(1);
+	});
+
+	it("tracks reused advice text for the cache-marker fix", async () => {
+		await h.run("on");
+		await step(transcript([]));
+		const stale = (await step(transcript([false])))!;
+		const payload = {
+			model: "claude",
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "Fix the test" }] },
+				{ role: "user", content: [{ type: "text", text: stale, cache_control: { type: "ephemeral" } }] },
+			],
+		};
+		const out = (await h.emit("before_provider_request", { type: "before_provider_request", payload })) as typeof payload;
+		expect(out.messages[1]!.content[0]).not.toHaveProperty("cache_control");
+		expect(out.messages[0]!.content[0]).toHaveProperty("cache_control");
 	});
 });

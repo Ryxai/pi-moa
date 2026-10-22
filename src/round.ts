@@ -1,17 +1,24 @@
 import { runAdvisors, type AdvisorRequest, type AdvisorResult, type CompleteFn } from "./advisors.ts";
 import { resolvePreset, type ModelLike, type ModelLookup } from "./config-resolve.ts";
 import { getPreset, type MoaConfig } from "./config.ts";
-import { arrangeAdvisors, frameAdvice } from "./framing.ts";
+import { arrangeAdvisors } from "./framing.ts";
 import { assemblePrompt, DEFAULT_ROLE, type PromptFileReader } from "./roles.ts";
-import { turnPosition, type TurnPosition } from "./state.ts";
 import { moveCacheMarker } from "./cache.ts";
+import type { TriggerReason } from "./triggers.ts";
 import { ADVICE_REQUEST_BLOCKS, buildTextView, type AgentMessage } from "./view.ts";
 
 export const RECORD_ENTRY = "moa";
 
-export interface MoaRecord extends TurnPosition {
+export interface MoaRecord {
 	preset: string;
+	/** Which trigger started the round. */
+	reason: TriggerReason;
+	/** Turn key (see `analyzeTurn`). */
+	turn: string;
+	step: number;
 	advisors: AdvisorResult[];
+	/** Set when the request was aborted during the round; its advice is not used. */
+	interrupted?: true;
 }
 
 export interface RoundInput<M extends ModelLike> {
@@ -24,13 +31,16 @@ export interface RoundInput<M extends ModelLike> {
 	signal?: AbortSignal;
 	/** pi session id; advisors get their own per-slot provider session id derived from it. */
 	sessionId?: string;
+	reason: TriggerReason;
+	turn: string;
+	step: number;
 }
 
 export interface RoundOutput {
-	/** The request's messages with the advice appended. */
-	messages: AgentMessage[];
-	/** The exact advice text injected (the trailing user message's only text block). */
-	advice: string;
+	/** In display order. */
+	results: AdvisorResult[];
+	/** `signal` was aborted during the round: never cache or inject its advice. */
+	interrupted: boolean;
 }
 
 /**
@@ -54,10 +64,12 @@ export interface RoundDeps<M> {
 	now?: () => number;
 }
 
-/**
- * Runs one advisor round and returns the request's messages with the advice appended as a
- * trailing user message (plus the advice text), or undefined when there is no advice. `input.messages` is not modified.
- */
+/** The request's messages with `text` appended as a trailing user message; `messages` is not modified. */
+export function appendAdvice(messages: readonly AgentMessage[], text: string, timestamp: number): AgentMessage[] {
+	return [...messages, { role: "user", content: [{ type: "text", text }], timestamp }];
+}
+
+/** Runs and records one advisor round; undefined when the preset has no usable advisors. */
 export async function runRound<M extends ModelLike>(input: RoundInput<M>, deps: RoundDeps<M>): Promise<RoundOutput | undefined> {
 	const debug = deps.debug ?? (() => {});
 	const now = deps.now ?? Date.now;
@@ -93,16 +105,14 @@ export async function runRound<M extends ModelLike>(input: RoundInput<M>, deps: 
 	}));
 	const results = await runAdvisors(requests, { complete: deps.complete, signal: input.signal, timeoutMs: preset.timeoutMs, now });
 
-	const record: MoaRecord = { preset: input.presetName, ...turnPosition(input.messages), advisors: results };
+	const interrupted = input.signal?.aborted === true;
+	const record: MoaRecord = { preset: input.presetName, reason: input.reason, turn: input.turn, step: input.step, advisors: results };
+	if (interrupted) record.interrupted = true;
 	try {
 		deps.appendEntry(RECORD_ENTRY, record);
 	} catch (error) {
 		debug(`record failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
-	debug(`round ${input.presetName}: ${results.map((r) => `${r.label}=${r.ok ? "ok" : r.error}`).join(" ")}`);
-
-	const text = frameAdvice(results);
-	if (!text) return undefined;
-	const advice: AgentMessage = { role: "user", content: [{ type: "text", text }], timestamp: now() };
-	return { messages: [...input.messages, advice], advice: text };
+	debug(`round ${input.presetName} (${input.reason}, step ${input.step}): ${results.map((r) => `${r.label}=${r.ok ? "ok" : r.error}`).join(" ")}`);
+	return { results, interrupted };
 }

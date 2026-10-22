@@ -4,8 +4,7 @@ import type { CompleteFn } from "../src/advisors.ts";
 import type { ModelLike, ModelLookup } from "../src/config-resolve.ts";
 import { DEFAULT_CONFIG, DEFAULT_PRESET, type MoaConfig } from "../src/config.ts";
 import { BASE_RULES, ROLE_PROMPTS } from "../src/roles.ts";
-import { runRound, type MoaRecord, type RoundDeps, type RoundInput } from "../src/round.ts";
-import { FRAMING_HEADER } from "../src/framing.ts";
+import { appendAdvice, runRound, type MoaRecord, type RoundDeps, type RoundInput } from "../src/round.ts";
 import { ADVICE_REQUEST } from "../src/view.ts";
 import { assistant, system, text, toolResult, user, usage } from "./fixtures.ts";
 
@@ -37,7 +36,17 @@ const messages = [system("You are pi."), user("Fix the test", 10), assistant([te
 function setup(complete: CompleteFn<ModelLike>, overrides: Partial<RoundInput<ModelLike>> = {}) {
 	const records: MoaRecord[] = [];
 	const logs: string[] = [];
-	const input: RoundInput<ModelLike> = { messages, config: council, presetName: "council", models, actor: sonnet, ...overrides };
+	const input: RoundInput<ModelLike> = {
+		messages,
+		config: council,
+		presetName: "council",
+		models,
+		actor: sonnet,
+		reason: "user_turn",
+		turn: "10:abc",
+		step: 1,
+		...overrides,
+	};
 	const deps: RoundDeps<ModelLike> = {
 		complete,
 		appendEntry: (type, data) => {
@@ -52,7 +61,7 @@ function setup(complete: CompleteFn<ModelLike>, overrides: Partial<RoundInput<Mo
 }
 
 describe("runRound", () => {
-	it("appends framed advice as a trailing user message and records the round", async () => {
+	it("runs the advisors in display order and records the round", async () => {
 		const contexts = new Map<string, Context>();
 		const { input, deps, records } = setup(async (model, context) => {
 			contexts.set(model.id, context);
@@ -60,18 +69,13 @@ describe("runRound", () => {
 		});
 		const snapshot = structuredClone(messages);
 		const result = await runRound(input, deps);
-		const out = result?.messages;
 
 		expect(messages).toEqual(snapshot);
-		expect(out).toHaveLength(messages.length + 1);
-		expect(out?.slice(0, -1)).toEqual(messages);
-		const advice = out?.at(-1);
-		expect(advice).toMatchObject({ role: "user", timestamp: 1234 });
-		const adviceText = (advice as { content: { text: string }[] }).content[0]!.text;
-		expect(adviceText.startsWith(FRAMING_HEADER)).toBe(true);
-		expect(adviceText).toContain("Advisor A (planner):\ngpt says hi");
-		expect(adviceText).toContain("Advisor B (critic):\nsonnet says hi");
-		expect(result?.advice).toBe(adviceText);
+		expect(result?.interrupted).toBe(false);
+		expect(result?.results.map((r) => [r.label, r.role, r.text])).toEqual([
+			["A", "planner", "gpt says hi"],
+			["B", "critic", "sonnet says hi"],
+		]);
 
 		expect(contexts.get("gpt")?.systemPrompt).toBe(`${BASE_RULES}\n\nPlan from file.`);
 		expect(contexts.get("sonnet")?.systemPrompt).toContain(ROLE_PROMPTS.critic);
@@ -79,18 +83,19 @@ describe("runRound", () => {
 		expect(contexts.get("gpt")?.messages.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
 
 		expect(records).toHaveLength(1);
-		expect(records[0]).toMatchObject({ preset: "council", turn: 10, step: 1 });
+		expect(records[0]).toMatchObject({ preset: "council", reason: "user_turn", turn: "10:abc", step: 1 });
+		expect(records[0]).not.toHaveProperty("interrupted");
 		expect(records[0]?.advisors.map((a) => [a.label, a.model, a.role, a.ok, a.costUsd])).toEqual([
 			["A", "openai/gpt", "planner", true, 0.01],
 			["B", "anthropic/sonnet", "critic", true, 0.01],
 		]);
 	});
 
-	it("records but returns undefined when every advisor fails", async () => {
+	it("records and returns failures when every advisor fails", async () => {
 		const { input, deps, records } = setup(async () => {
 			throw new Error("down");
 		});
-		expect(await runRound(input, deps)).toBeUndefined();
+		expect((await runRound(input, deps))?.results.every((r) => !r.ok)).toBe(true);
 		expect(records[0]?.advisors.map((a) => a.error)).toEqual(["down", "down"]);
 	});
 
@@ -99,7 +104,7 @@ describe("runRound", () => {
 		deps.appendEntry = () => {
 			throw new Error("disk full");
 		};
-		expect((await runRound(input, deps))?.messages).toHaveLength(messages.length + 1);
+		expect((await runRound(input, deps))?.results.every((r) => r.ok)).toBe(true);
 		expect(logs.some((l) => l.includes("disk full"))).toBe(true);
 	});
 
@@ -154,8 +159,28 @@ describe("runRound", () => {
 		expect(seen.every((o) => o.sessionId === undefined)).toBe(true);
 	});
 
+	it("marks a round interrupted when the request is aborted during it", async () => {
+		const controller = new AbortController();
+		const { input, deps, records } = setup(async () => {
+			controller.abort();
+			return assistant([text("late")]);
+		}, { signal: controller.signal, reason: "on_failure" });
+		expect((await runRound(input, deps))?.interrupted).toBe(true);
+		expect(records[0]).toMatchObject({ reason: "on_failure", interrupted: true });
+	});
+
 	it("skips an unknown preset", async () => {
 		const { input, deps } = setup(async () => assistant([text("ok")]), { presetName: "nope" });
 		expect(await runRound(input, deps)).toBeUndefined();
+	});
+});
+
+describe("appendAdvice", () => {
+	it("appends the text as a trailing user message without touching the input", () => {
+		const snapshot = structuredClone(messages);
+		const out = appendAdvice(messages, "advice", 99);
+		expect(messages).toEqual(snapshot);
+		expect(out.slice(0, -1)).toEqual(messages);
+		expect(out.at(-1)).toEqual({ role: "user", content: [{ type: "text", text: "advice" }], timestamp: 99 });
 	});
 });

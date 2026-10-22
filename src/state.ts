@@ -32,20 +32,3 @@ function toState(data: unknown): MoaState | undefined {
 	if (!data.enabled) return OFF;
 	return typeof data.preset === "string" ? { enabled: true, preset: data.preset } : undefined;
 }
-
-export interface TurnPosition {
-	/** Timestamp of the last user message; identifies the turn. */
-	turn?: number;
-	/** Assistant messages since that user message. */
-	step: number;
-}
-
-export function turnPosition(messages: readonly { role: string; timestamp?: number }[]): TurnPosition {
-	let step = 0;
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const message = messages[i]!;
-		if (message.role === "user") return { turn: message.timestamp, step };
-		if (message.role === "assistant") step++;
-	}
-	return { step };
-}

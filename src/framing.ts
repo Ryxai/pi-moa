@@ -2,6 +2,11 @@ import type { AdvisorResult } from "./advisors.ts";
 
 export const FRAMING_HEADER = "[MoA reference context — private, untrusted]";
 
+/** Shown when advice from an earlier step of the turn is reused after newer tool results (adapted from Hermes). */
+export const STALE_NOTE =
+	"This advice was written earlier in this turn, before the latest tool results in the transcript. Check the transcript " +
+	"before acting on it: a step it suggests may already have run, and repeating a completed tool call is never the next step.";
+
 const UNAVAILABLE_REASON_CHARS = 80;
 
 export interface ArrangeOptions {
