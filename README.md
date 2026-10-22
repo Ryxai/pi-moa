@@ -4,9 +4,10 @@ Mixture of Models for the [pi](https://pi.dev) coding agent. Before your model (
 1–3 advisor models look at the conversation and give advice that the actor sees for that one request only.
 The design is in [PLAN.md](PLAN.md).
 
-**Status: early.** Config, `/moa on|off` and session state work. While on, the preset's advisors
-run when one of its triggers fires; their advice is added to that request only, and each fresh
-round is saved as a `moa` session entry with its trigger.
+**Status: all planned steps built.** MoA is active via `/moa on` (session toggle), a one-shot
+`/moa <prompt>`, or by selecting a `moa/<preset>` virtual model (optional). While active, the
+preset's advisors run when one of its triggers fires; their advice is added to that request only,
+and each fresh round is saved as a `moa` session entry with its trigger.
 
 **What advisors see** (`context.view`, default `"auto"`):
 - `native` (auto: the advisor is the actor's model, e.g. `"current"`): the actor's own request —
@@ -139,7 +140,47 @@ consults; the default returns when the last one ends). Round entries are shown i
 interactive mode only: pi's HTML export skips custom entries (consult results are exported with
 their card, collapsed and expanded), and print/JSON/RPC modes do not render them.
 
-`moa/<preset>` virtual models and one-shot `/moa <prompt>` are planned.
+**One-shot `/moa <prompt>`** (interactive and RPC modes only; print/JSON mode exit before the
+turn would run, so it is refused there, as it is during a manual `/compact`): sends `<prompt>` as a user message with MoA for that turn only (all
+of its steps, until the next user message), using your selected model as the actor and the
+default preset. It never changes the model, the `/moa on` state or anything else saved in the
+session (the round's `moa` record is still written). The preset and its models are checked first,
+as for `/moa on`; if they are unusable nothing is sent. If the agent is busy, the prompt is queued
+as a follow-up (it runs after the current work, as its own turn). Sending is fire-and-forget:
+pi reports a failed send itself, and the notice only says the prompt was sent or queued. If MoA is already active (`/moa on`
+or a `moa/*` model), it is a normal message with that preset. The turn is recognised by its
+message text, so if another extension rewrites the message on input, MoA does not run for it;
+the one-shot is dropped when the agent settles or the session changes. The `consult` tool is not
+added for a one-shot turn (changing the tool set costs a prompt-cache miss each way).
+
+**Virtual models** (`"virtualModels": true`): every preset gets a selectable model `moa/<preset>`
+(`MoA: <preset>` in `/model`). Selecting it turns MoA on with that preset for as long as it is
+selected, independent of `/moa on`: the selected model wins, because it names both the preset and
+the actor; a `/moa on` state stays saved and applies again once you select a regular model. Each
+request is routed (pi virtual models, see pi's `docs/virtual-models.md`) to the preset's `actor`:
+- `"provider/id"`: that model; the virtual model offers that model's thinking levels.
+- `"current"`: the last regular model you selected before switching to `moa/*` (from pi's
+  `model_select`). The choice is stored as router state on the session branch, so it survives
+  resume, `/tree` and forks. A regular model selected since the current session started wins;
+  otherwise the branch's state is used, then a model selected earlier while pi was running (e.g.
+  before `/new` or a session switch), then the model that answered last; with none of these
+  the request fails with "no physical model known yet; select a regular model first". It offers
+  every thinking level; pi clamps the level to the routed model.
+- Tool-call continuations and retries stay on the model and thinking level that handled the turn
+  (keeps prompt caches and thinking signatures valid).
+
+While a `moa/*` model is selected, `"current"` advisors, the native view and `view: "auto"` use the
+routed model as the actor (with the thinking level the router picked, clamped to that model;
+if the actor cannot be resolved, the model that answered last, as the router does), `consult` is available (if the preset allows it), the footer shows
+`moa/<preset>` and `/moa` shows the routed actor. Selecting it warns if the preset cannot run its
+advisors. A budget `stop` stops the advisors (it cannot unselect the model). Preset names must be
+usable model ids (letters, digits, `.`, `_`, `-`) and presets with config issues get no model;
+both are reported. Models are re-synced on session start and `/moa reload` (removed when the
+preset or `virtualModels` goes away, including models left by the extension instance before a
+pi `/reload`; unchanged models are not re-registered). pi restores a session's selected model before extensions
+see the session, so at load only the global config is read: a `moa/*` model for a preset defined
+only in a project `.pi/moa.json` is not available at that moment and pi falls back to the model
+that answered last.
 
 **Prompt caching:** the advice changes every request, so MoA moves the conversation cache marker
 (Anthropic `cache_control`, `cache_control` on OpenRouter `anthropic/*` chat completions, Bedrock
@@ -165,10 +206,11 @@ pi install ./path/to/pi-moa      # or: pi -e ./path/to/pi-moa for one run
 | `/moa off` | Turn it off |
 | `/moa reload` | Re-read config files; turns MoA off with a warning if the active preset is no longer usable |
 | `/moa init` | Write the built-in defaults to the global config file (never overwrites) |
-| `/moa <prompt>` | One-shot turn — planned |
+| `/moa <prompt>` | Send `<prompt>` with MoA for that turn only (default preset; queued as a follow-up while busy) |
+| `/model moa/<preset>` | With `virtualModels: true`: MoA with that preset while selected (see Virtual models) |
 
 The on/off state is saved in the session and restored on resume, per branch.
-The footer shows `moa:<preset>` while on.
+The footer shows `moa:<preset>` while on (`moa/<preset>` while a virtual model is selected).
 
 ## Config
 

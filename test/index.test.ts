@@ -3,13 +3,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Context } from "@earendil-works/pi-ai";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { EntryRenderer, ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { EntryRenderer, ExtensionAPI, ExtensionCommandContext, ExtensionVirtualModel, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import moa from "../src/index.ts";
 import { STALE_NOTE } from "../src/framing.ts";
 import { RECORD_ENTRY, type MoaRecord } from "../src/round.ts";
 import { STATE_ENTRY, type EntryLike } from "../src/state.ts";
 import { ADVICE_REQUEST } from "../src/view.ts";
 import { assistant, fakeTheme, system, text, toolResult, user, usage } from "./fixtures.ts";
+import type { AgentMessage } from "../src/view.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 type Note = { message: string; type: string };
@@ -31,13 +32,36 @@ interface Harness {
 	/** Registered tools by name, the active set, and every `setActiveTools` call. */
 	tools: { registered: Map<string, ToolDefinition>; active: string[]; sets: string[][] };
 	entryRenderers: Map<string, EntryRenderer>;
+	/** Registered virtual models by id (all under provider `moa`), and every registration call. */
+	virtual: Map<string, ExtensionVirtualModel<unknown>>;
+	registrations: string[];
+	/** `sendUserMessage` calls. */
+	sent: { content: unknown; options: unknown }[];
+	/** The selected model (`ctx.model`) and whether the agent is idle. */
+	sel: { model: TestModel | undefined; idle: boolean };
+	/** Selects `next` as pi does: updates `ctx.model`, then emits `model_select`. */
+	select(next: TestModel, source?: string): Promise<unknown>;
 }
 
-const model = { provider: "anthropic", id: "sonnet" };
+interface TestModel {
+	provider: string;
+	id: string;
+	api?: string;
+	reasoning?: boolean;
+}
 
-async function setup(): Promise<Harness> {
+const model: TestModel = { provider: "anthropic", id: "sonnet" };
+const gpt: TestModel = { provider: "openai", id: "gpt", reasoning: true };
+const virtualModel = (id: string): TestModel => ({ provider: "moa", id, api: "pi-virtual" });
+
+async function setup(globalConfig?: unknown): Promise<Harness> {
 	const agentDir = await mkdtemp(join(tmpdir(), "pi-moa-agent-"));
 	process.env.PI_CODING_AGENT_DIR = agentDir;
+	if (globalConfig !== undefined) await writeFile(join(agentDir, "moa.json"), JSON.stringify(globalConfig));
+	const virtual = new Map<string, ExtensionVirtualModel<unknown>>();
+	const registrations: string[] = [];
+	const sent: { content: unknown; options: unknown }[] = [];
+	const sel: { model: TestModel | undefined; idle: boolean } = { model, idle: true };
 	const entries: EntryLike[] = [];
 	const notes: Note[] = [];
 	const status = new Map<string, string | undefined>();
@@ -71,15 +95,29 @@ async function setup(): Promise<Harness> {
 		getSettings: () => ({ images: { blockImages: piState.blockImages }, thinkingBudgets: { low: 3000 } }),
 		getThinkingLevel: () => piState.thinking,
 		registerEntryRenderer: (customType: string, renderer: EntryRenderer) => entryRenderers.set(customType, renderer),
+		registerVirtualModel: (definition: ExtensionVirtualModel<unknown>) => {
+			registrations.push(definition.id);
+			virtual.set(definition.id, definition);
+		},
+		unregisterVirtualModel: (_provider: string, id: string) => virtual.delete(id),
+		sendUserMessage: (content: unknown, options: unknown) => sent.push({ content, options }),
 	};
-	moa(pi as unknown as ExtensionAPI);
+	await moa(pi as unknown as ExtensionAPI);
+	const catalog = [model, gpt];
 	const ctx = {
 		cwd: join(agentDir, "project"),
 		hasUI: true,
-		model,
+		get model() {
+			return sel.model;
+		},
+		mode: "tui",
+		isIdle: () => sel.idle,
 		isProjectTrusted: () => false,
 		modelRegistry: {
-			find: (provider: string, id: string) => (provider === model.provider && id === model.id ? model : undefined),
+			find: (provider: string, id: string) =>
+				catalog.find((m) => m.provider === provider && m.id === id) ??
+				(provider === "moa" && virtual.has(id) ? virtualModel(id) : undefined),
+			getAll: () => [...catalog, ...[...virtual.keys()].map(virtualModel)],
 			hasConfiguredAuth: () => auth.ok,
 			streamSimple: (m: { id: string }, context: Context, options: unknown) => {
 				llm.options.push(options);
@@ -110,6 +148,15 @@ async function setup(): Promise<Harness> {
 		piState,
 		tools,
 		entryRenderers,
+		virtual,
+		registrations,
+		sent,
+		sel,
+		select: async (next, source = "set") => {
+			const previousModel = sel.model;
+			sel.model = next;
+			return handlers.get("model_select")?.({ type: "model_select", model: next, previousModel, source }, ctx);
+		},
 	};
 }
 
@@ -229,11 +276,6 @@ describe("/moa init", () => {
 });
 
 describe("other commands and hooks", () => {
-	it("reports one-shot prompts as not implemented", async () => {
-		await h.run("fix the failing test");
-		expect(h.lastNote()?.message).toContain("not implemented yet");
-	});
-
 	it("status reports on with the preset", async () => {
 		await h.run("on");
 		await h.run("");
@@ -1054,5 +1096,301 @@ describe("UI", () => {
 		expect((await consult()).isError).toBeUndefined();
 		Object.assign(h.ctx, { hasUI: false });
 		expect(await round(200)).toBeDefined();
+	});
+});
+
+describe("moa/<preset> virtual models", () => {
+	const records = () => h.entries.filter((e) => e.customType === RECORD_ENTRY).map((e) => e.data as MoaRecord);
+	const turnEvent = (t = 1) => ({ type: "context_with_system", messages: [system("You are pi."), user("Fix the test", t)] });
+	const config = { virtualModels: true, presets: { council: { actor: "openai/gpt" } } };
+	const route = (id: string, request: Record<string, unknown> = {}) =>
+		h.virtual.get(id)!.route({ model: virtualModel(id), thinkingLevel: "high", reason: "user", messages: [], ...request } as never, h.ctx as never);
+
+	it("registers none while virtualModels is false", async () => {
+		expect(h.virtual.size).toBe(0);
+		await writeGlobal(h, { presets: { council: {} } });
+		await h.run("reload");
+		expect(h.virtual.size).toBe(0);
+	});
+
+	it("registers one model per valid preset at load, before any session starts", async () => {
+		h = await setup(config);
+		expect([...h.virtual.keys()]).toEqual(["solo", "council"]);
+		expect(h.virtual.get("council")).toMatchObject({ provider: "moa", id: "council", name: "MoA: council" });
+		expect(h.virtual.get("solo")?.thinkingLevels).toEqual(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+	});
+
+	it("re-syncs on reload and reports presets that cannot be models", async () => {
+		await writeGlobal(h, { ...config, presets: { council: { actor: "openai/gpt" }, "two words": {} } });
+		await h.run("reload");
+		expect([...h.virtual.keys()]).toEqual(["solo", "council"]);
+		expect(h.notes.some((n) => n.type === "warning" && n.message.includes("two words: not usable as a model id"))).toBe(true);
+		await writeGlobal(h, { virtualModels: true });
+		await h.run("reload");
+		expect([...h.virtual.keys()]).toEqual(["solo"]);
+		await writeGlobal(h, {});
+		await h.run("reload");
+		expect(h.virtual.size).toBe(0);
+	});
+
+	it("removes moa models left registered by an earlier instance (pi /reload)", async () => {
+		h.virtual.set("stale", { provider: "moa", id: "stale" } as ExtensionVirtualModel<unknown>);
+		await h.emit("session_start");
+		expect(h.virtual.has("stale")).toBe(false);
+	});
+
+	it("does not re-register unchanged models on session start or tree navigation", async () => {
+		h = await setup(config);
+		await h.emit("session_start");
+		const count = h.registrations.length;
+		await h.emit("session_tree");
+		await h.emit("session_start");
+		expect(h.registrations.length).toBe(count);
+	});
+
+	it("warns on reload when the selected moa model is gone", async () => {
+		h = await setup(config);
+		await h.emit("session_start");
+		await h.select(virtualModel("council"));
+		await writeGlobal(h, { virtualModels: true });
+		await h.run("reload");
+		expect(h.lastNote()?.message ?? "").not.toBe("");
+		expect(h.notes.some((n) => n.message.includes("moa/council is no longer available"))).toBe(true);
+	});
+
+	describe("route()", () => {
+		beforeEach(async () => {
+			h = await setup(config);
+			await h.emit("session_start");
+		});
+
+		it("routes a concrete actor", async () => {
+			expect(await route("council")).toEqual({ model: gpt, thinkingLevel: "high" });
+		});
+
+		it('routes "current" to the model selected before switching, and stores it as state', async () => {
+			await h.select(gpt);
+			await h.select(virtualModel("solo"));
+			expect(await route("solo")).toEqual({ model: gpt, thinkingLevel: "high", state: { actor: "openai/gpt" } });
+			expect(await route("solo", { state: { actor: "openai/gpt" } })).toEqual({ model: gpt, thinkingLevel: "high" });
+		});
+
+		/** A runtime started with `moa/solo` already selected (a resume): nothing tracked. */
+		const resumed = async () => {
+			h = await setup(config);
+			h.sel.model = virtualModel("solo");
+			await h.emit("session_start");
+		};
+
+		it("uses the branch state after a resume and falls back to request.previous", async () => {
+			await resumed();
+			expect((await route("solo", { state: { actor: "openai/gpt" } })).model).toBe(gpt);
+			expect((await route("solo", { previous: { model, thinkingLevel: "low" } })).model).toBe(model);
+		});
+
+		it("prefers the branch state over a selection carried over from another session", async () => {
+			await h.select(virtualModel("solo"));
+			await h.emit("session_start");
+			expect((await route("solo", { state: { actor: "openai/gpt" } })).model).toBe(gpt);
+			expect((await route("solo")).model).toBe(model);
+		});
+
+		it("fails with a clear error when no physical model is known", async () => {
+			await resumed();
+			await expect(async () => route("solo")).rejects.toThrow(/no physical model known yet/);
+		});
+
+		it("throws for a preset removed from the config", async () => {
+			await writeGlobal(h, { virtualModels: true });
+			const definition = h.virtual.get("council")!;
+			await h.run("reload");
+			expect(() => definition.route({ model: virtualModel("council"), thinkingLevel: "high", reason: "user", messages: [] } as never, h.ctx as never)).toThrow(
+				/preset "council" is not configured/,
+			);
+		});
+	});
+
+	describe("activation by the selected model", () => {
+		beforeEach(async () => {
+			h = await setup(config);
+			await h.emit("session_start");
+		});
+
+		it("is active with the model's preset, status and consult, without /moa on", async () => {
+			await h.select(virtualModel("solo"));
+			expect(h.status.get("moa")).toBe("moa/solo");
+			expect(h.tools.active).toContain("consult");
+			expect(stateEntries(h)).toEqual([]);
+			const result = (await h.emit("context_with_system", turnEvent())) as { messages: unknown[] } | undefined;
+			expect(result?.messages).toHaveLength(3);
+			expect(records()[0]?.preset).toBe("solo");
+			await h.select(gpt);
+			expect(h.status.get("moa")).toBeUndefined();
+			expect(h.tools.active).not.toContain("consult");
+		});
+
+		it("resolves advisors against the routed physical actor, not the virtual model", async () => {
+			const asked: string[] = [];
+			h.llm.reply = async (m) => {
+				asked.push(`${(m as TestModel).provider}/${m.id}`);
+				return assistant([text("advice")]);
+			};
+			await h.select(gpt);
+			await h.select(virtualModel("solo"));
+			await h.emit("context_with_system", turnEvent());
+			expect(asked).toEqual(["openai/gpt"]);
+			expect(records()[0]?.advisors[0]).toMatchObject({ model: "openai/gpt", ok: true });
+			// "current" equals the routed actor, so the advisor gets the native view (the actor's own prompt).
+			expect(h.llm.contexts[0]?.systemPrompt).toBeUndefined();
+			expect(JSON.stringify(h.llm.contexts[0]?.messages[0])).toContain("You are pi.");
+		});
+
+		it("falls back to the model that answered last when the actor cannot be resolved, as route() does", async () => {
+			h = await setup({ virtualModels: true, presets: { gone: { actor: "openai/missing" } } });
+			await h.emit("session_start");
+			await h.select(virtualModel("gone"));
+			const answered = assistant([text("done")], { provider: "openai", model: "gpt" });
+			await h.emit("context_with_system", { type: "context_with_system", messages: [system("You are pi."), user("Fix", 1), answered, user("More", 3)] });
+			expect(records()[0]?.advisors[0]).toMatchObject({ model: "openai/gpt", ok: true });
+		});
+
+		it("gives native advisors the routed thinking level, clamped to the actor", async () => {
+			await h.select(gpt);
+			await h.select(virtualModel("solo"));
+			h.piState.thinking = "max";
+			await h.emit("context_with_system", turnEvent(1));
+			expect(h.llm.options.at(-1)).toMatchObject({ reasoning: "high" });
+			await route("solo", { thinkingLevel: "low" });
+			await h.emit("context_with_system", turnEvent(2));
+			expect(h.llm.options.at(-1)).toMatchObject({ reasoning: "low" });
+		});
+
+		it("takes precedence over /moa on, which resumes when a physical model is selected again", async () => {
+			await writeGlobal(h, { ...config, presets: { ...config.presets, other: {} } });
+			await h.run("reload");
+			await h.run("on other");
+			await h.select(virtualModel("council"));
+			expect(h.status.get("moa")).toBe("moa/council");
+			await h.emit("context_with_system", turnEvent());
+			expect(records().at(-1)?.preset).toBe("council");
+			await h.run("");
+			expect(h.lastNote()?.message).toMatch(/^MoA on via model moa\/council · preset council/);
+			expect(h.lastNote()?.message).toContain("actor: openai/gpt");
+			await h.select(model);
+			expect(h.status.get("moa")).toBe("moa:other");
+		});
+
+		it("keeps a restored /moa on while a moa model with an unknown actor is selected", async () => {
+			h = await setup(config);
+			h.entries.push({ type: "custom", customType: STATE_ENTRY, data: { enabled: true, preset: "solo" } });
+			h.sel.model = virtualModel("solo");
+			await h.emit("session_start");
+			expect(h.notes.some((n) => n.message.includes("restored as off"))).toBe(false);
+			await h.select(gpt);
+			expect(h.status.get("moa")).toBe("moa:solo");
+		});
+
+		it("warns when the selected preset cannot run advisors", async () => {
+			h.sel.model = virtualModel("solo");
+			await h.emit("session_start");
+			await h.select(virtualModel("council"));
+			expect(h.notes.some((n) => n.type === "warning" && n.message.includes("moa/council cannot run advisors with this model"))).toBe(false);
+			h.auth.ok = false;
+			await h.select(virtualModel("solo"));
+			expect(h.lastNote()).toMatchObject({ type: "warning" });
+			expect(h.lastNote()?.message).toContain("moa/solo cannot run advisors with this model");
+		});
+	});
+});
+
+describe("/moa <prompt> one-shot", () => {
+	const records = () => h.entries.filter((e) => e.customType === RECORD_ENTRY);
+	const turn = (prompt: string, t: number, ...rest: AgentMessage[]) => ({
+		type: "context_with_system",
+		messages: [system("You are pi."), user(prompt, t), ...rest],
+	});
+	const call = { type: "toolCall" as const, id: "c1", name: "bash", arguments: { cmd: "ls" } };
+
+	it("sends the prompt and runs MoA for every step of that turn only", async () => {
+		await h.run("fix the bug");
+		expect(h.sent).toEqual([{ content: "fix the bug", options: undefined }]);
+		expect(h.lastNote()?.message).toBe("MoA for this turn (preset solo): prompt sent");
+		expect(await h.emit("context_with_system", turn("fix the bug", 5))).toBeDefined();
+		const step = await h.emit("context_with_system", turn("fix the bug", 5, assistant([call]), toolResult("bash", "ok")));
+		expect(step).toBeDefined();
+		expect(records()).toHaveLength(1);
+		expect(await h.emit("context_with_system", turn("next", 9))).toBeUndefined();
+		// The same text later is a normal message.
+		expect(await h.emit("context_with_system", turn("fix the bug", 12))).toBeUndefined();
+		expect(records()).toHaveLength(1);
+		expect(stateEntries(h)).toEqual([]);
+		expect(h.status.get("moa")).toBeUndefined();
+		expect(h.sel.model).toBe(model);
+	});
+
+	it("is cleared when the agent settles or the session changes before its turn", async () => {
+		await h.run("fix the bug");
+		await h.emit("agent_settled", { type: "agent_settled", aborted: false });
+		expect(await h.emit("context_with_system", turn("fix the bug", 5))).toBeUndefined();
+		await h.run("fix the bug");
+		await h.emit("session_start");
+		expect(await h.emit("context_with_system", turn("fix the bug", 6))).toBeUndefined();
+	});
+
+	it("does not bind to the turn that was current when it was sent", async () => {
+		await h.emit("context_with_system", turn("again", 3));
+		await h.run("again");
+		expect(await h.emit("context_with_system", turn("again", 3, assistant([call]), toolResult("bash", "ok")))).toBeUndefined();
+		expect(await h.emit("context_with_system", turn("again", 7))).toBeDefined();
+	});
+
+	it("queues as a follow-up while the agent is busy", async () => {
+		h.sel.idle = false;
+		await h.run("then add tests");
+		expect(h.sent).toEqual([{ content: "then add tests", options: { deliverAs: "followUp" } }]);
+		expect(h.lastNote()?.message).toContain("prompt queued as a follow-up");
+	});
+
+	it("is refused while a manual compaction runs", async () => {
+		await h.emit("session_before_compact", { type: "session_before_compact", reason: "manual" });
+		await h.run("fix the bug");
+		expect(h.lastNote()).toMatchObject({ type: "error" });
+		expect(h.lastNote()?.message).toContain("compaction is running");
+		expect(h.sent).toEqual([]);
+		await h.emit("session_compact_failed", { type: "session_compact_failed", reason: "manual" });
+		await h.run("fix the bug");
+		expect(h.sent).toHaveLength(1);
+	});
+
+	it("is refused in print and JSON modes", async () => {
+		Object.assign(h.ctx, { mode: "print" });
+		await h.run("fix the bug");
+		expect(h.lastNote()?.message).toContain("interactive and RPC modes only");
+		expect(h.sent).toEqual([]);
+	});
+
+	it("refuses an unusable preset without sending", async () => {
+		h.auth.ok = false;
+		await h.run("fix the bug");
+		expect(h.lastNote()).toMatchObject({ type: "error" });
+		expect(h.lastNote()?.message).toContain('cannot run /moa <prompt> with preset "solo"');
+		expect(h.sent).toEqual([]);
+	});
+
+	it("is a normal message while MoA is already on", async () => {
+		await h.run("on");
+		await h.run("fix the bug");
+		expect(h.lastNote()?.message).toBe("MoA already on (preset solo): prompt sent");
+		expect(h.sent).toHaveLength(1);
+		expect(stateEntries(h)).toEqual([{ enabled: true, preset: "solo" }]);
+	});
+
+	it("uses the selected moa model's preset and routed actor", async () => {
+		h = await setup({ virtualModels: true, presets: { council: { actor: "openai/gpt" } } });
+		await h.emit("session_start");
+		await h.select(virtualModel("council"));
+		await h.run("fix the bug");
+		expect(h.lastNote()?.message).toBe("MoA already on (preset council): prompt sent");
+		expect(h.sel.model).toEqual(virtualModel("council"));
 	});
 });

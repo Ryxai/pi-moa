@@ -31,6 +31,23 @@ The actor answers, calls tools and is saved as usual.
 
 `"current"` in an advisor slot always means "the actor".
 
+*Built (step 9), deviations:* a selected `moa/<preset>` wins over `/moa on` (which stays saved and
+applies again after switching to a regular model); a one-shot uses the active preset or
+`defaultPreset`. `actor: "current"` resolves, in order, to a regular model selected in this
+session (`model_select`: the model itself, or `previousModel` when switching to `moa/*`), the
+branch's router state (written on every change), a selection carried over from an earlier
+session, and `request.previous`; rounds compute the actor with the same function (pi writes the
+route state before the request hook runs). Continuations/retries stay on `previous`/`failed` when
+it is the actor. Virtual models are registered at load from the global config (pi restores the
+session's selection before `session_start`) and re-synced with the project config on session
+start and `/moa reload`. One-shot: the prompt is sent with `sendUserMessage` (`followUp` while
+busy) and bound in the hook to the first new turn whose user message text equals it (never the
+turn current when sent); it applies to every step of that turn, ends at the next turn,
+`agent_settled` or a session change, and does not add `consult`. It is refused in print/JSON mode (pi exits before
+the run) and during a manual `/compact` (pi rejects prompts then). Sync also unregisters `moa/*`
+models listed by `modelRegistry.getAll()` that an earlier instance left behind (pi `/reload` keeps
+the model runtime).
+
 ## Per-request flow (`context_with_system`)
 
 1. **Active?** Skip unless MoA is on for this session or a `moa/*` model is selected.
@@ -259,6 +276,8 @@ moa/
     consult.ts        the consult tool (tool-names.ts: its name)
     debug.ts          PI_MOA_DEBUG log
     render.ts         entry and consult renderers, status line, progress text
+    virtual.ts        moa/<preset> virtual models: plan, actor resolution, route()
+    oneshot.ts        /moa <prompt> turn binding
   test/               vitest unit tests
 ```
 

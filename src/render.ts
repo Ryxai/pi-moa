@@ -155,9 +155,12 @@ export function renderConsultResult(
 	return recordComponent(record, isExpanded(display, options.expanded), theme);
 }
 
-/** Footer status: `moa:<preset>`, plus spend when non-zero and a marker once the budget is reached. */
-export function statusLine(preset: string, spend: Spend, budget: MoaConfig["budget"] | undefined): string {
-	const parts = [`moa:${preset}`];
+/**
+ * Footer status: `moa:<preset>` (session toggle) or `moa/<preset>` (selected virtual model), plus
+ * spend when non-zero and a marker once the budget is reached.
+ */
+export function statusLine(preset: string, spend: Spend, budget: MoaConfig["budget"] | undefined, viaModel = false): string {
+	const parts = [viaModel ? `moa/${preset}` : `moa:${preset}`];
 	if (spend.usd > 0) parts.push(formatUsd(spend.usd));
 	if (budget && budgetAction(budget, spend.usd) !== "run") parts.push("budget reached");
 	return parts.join(SEP);

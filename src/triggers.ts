@@ -29,6 +29,8 @@ export interface TurnAnalysis {
 	repeatStreakId?: string;
 	/** Responses before the latest tool result of the turn (0 without one): advice from an earlier step predates it. */
 	lastToolResultStep: number;
+	/** Text of the turn's user message (images as placeholders); absent after compaction. */
+	userText?: string;
 }
 
 export type TriggerReason = "user_turn" | "every_step" | "every_n" | "on_failure";
@@ -111,6 +113,7 @@ export function analyzeTurn(messages: readonly AgentMessage[]): TurnAnalysis {
 		repeatedCalls,
 		repeatStreakId,
 		lastToolResultStep,
+		...(userMessage && { userText: contentText(userMessage.content) }),
 	};
 }
 
