@@ -5,7 +5,7 @@ import type { ModelLike, ModelLookup } from "../src/config-resolve.ts";
 import { DEFAULT_CONFIG, DEFAULT_PRESET, type MoaConfig } from "../src/config.ts";
 import { BASE_RULES, NATIVE_BASE_RULES, ROLE_PROMPTS } from "../src/roles.ts";
 import { advisorView, appendAdvice, runRound, type MoaRecord, type RoundDeps, type RoundInput } from "../src/round.ts";
-import { ADVICE_REQUEST } from "../src/view.ts";
+import { ADVICE_REQUEST, adviceRequest } from "../src/view.ts";
 import { assistant, system, text, toolResult, user, usage } from "./fixtures.ts";
 
 const sonnet: ModelLike = { provider: "anthropic", id: "sonnet" };
@@ -177,6 +177,27 @@ describe("runRound", () => {
 		expect(records[0]).toMatchObject({ reason: "on_failure", interrupted: true });
 	});
 
+	it("consult: appends the question to every advisor's request, records it, and saves no entry without appendEntry", async () => {
+		const contexts = new Map<string, Context>();
+		const { input, deps, records } = setup(
+			async (model, context) => {
+				contexts.set(model.id, context);
+				return assistant([text("ok")]);
+			},
+			{ reason: "consult", question: "Is the fixture wrong?" },
+		);
+		delete deps.appendEntry;
+		const out = await runRound(input, deps);
+		const request = adviceRequest("Is the fixture wrong?");
+		expect(request).toBe(`${ADVICE_REQUEST}\n\nThe acting agent asks: Is the fixture wrong?`);
+		const lastText = (c: Context) => (c.messages.at(-1)!.content as { text: string }[]).at(-1)!.text;
+		expect(lastText(contexts.get("sonnet")!).endsWith(`\n\n${request}`)).toBe(true);
+		expect(lastText(contexts.get("gpt")!)).toBe(`\n\n${request}`);
+		expect(records).toEqual([]);
+		expect(out?.record).toMatchObject({ preset: "council", reason: "consult", question: "Is the fixture wrong?", turn: "10:abc", step: 1 });
+		expect(out?.record.advisors).toBe(out?.results);
+	});
+
 	it("skips an unknown preset", async () => {
 		const { input, deps } = setup(async () => assistant([text("ok")]), { presetName: "nope" });
 		expect(await runRound(input, deps)).toBeUndefined();
@@ -245,6 +266,8 @@ describe("advisorView", () => {
 		const instruction = (native.context.messages.at(-1)!.content as { text: string }[])[0]!.text;
 		expect(native.tailTexts).toEqual([instruction]);
 		expect(advisorView(messages, slot(gpt), { input: input(), preset: preset({}) }).tailTexts).toContain(ADVICE_REQUEST);
+		const asked = advisorView(messages, slot(gpt), { input: input({ question: "Why?" }), preset: preset({}) });
+		expect(asked.tailTexts).toEqual([adviceRequest("Why?"), `\n\n${adviceRequest("Why?")}`]);
 	});
 });
 

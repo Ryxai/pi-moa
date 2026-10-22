@@ -137,7 +137,7 @@ function textOf(message: AssistantMessage): string {
 		.trim();
 }
 
-function addUsage(a: Usage | undefined, b: Usage | undefined): Usage | undefined {
+export function addUsage(a: Usage | undefined, b: Usage | undefined): Usage | undefined {
 	if (!a || !b) return a ?? b;
 	const cost = (key: keyof Usage["cost"]) => (a.cost?.[key] ?? 0) + (b.cost?.[key] ?? 0);
 	return {

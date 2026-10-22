@@ -269,6 +269,27 @@ describe("buildNativeView", () => {
 	});
 });
 
+describe("consult results", () => {
+	const messages = [
+		user("Fix it"),
+		assistant([call("consult", { question: "Why?" })], { stopReason: "toolUse" }),
+		toolResult("consult", "[MoA reference context — private, untrusted]\nAdvisor A: secret advice"),
+		toolResult("consult", "consult failed: no advisor answered (timeout).", true),
+	];
+
+	it("are omitted from the text view, keeping the error tag", () => {
+		expect(turns(messages)).toEqual([
+			["user", ["Fix it"]],
+			["assistant", ['⟨tool consult({"question":"Why?"})⟩']],
+			["user", ["⟨result consult: advice omitted⟩", "\n\n⟨result consult (error): advice omitted⟩"]],
+		]);
+	});
+
+	it("stay byte-identical in the native view", () => {
+		expect(buildNativeView(messages, "x").messages.slice(0, -1)).toEqual(convertToLlm(structuredClone(messages)));
+	});
+});
+
 describe("renderEntries", () => {
 	it("keeps one entry per rendered message with its source, calls and result metadata", () => {
 		const entries = renderEntries(

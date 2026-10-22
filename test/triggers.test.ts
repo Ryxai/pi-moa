@@ -27,6 +27,39 @@ const bash: AgentMessage = {
 const summary: AgentMessage = { role: "compactionSummary", summary: "earlier", tokensBefore: 10, timestamp: 52 };
 const advice = (): AgentMessage => ({ role: "user", content: [text(`${FRAMING_HEADER}\nAdvice…`)], timestamp: 53 });
 
+describe("analyzeTurn and consult", () => {
+	const consultResult = (isError = false, id?: string): AgentMessage => ({ ...toolResult("consult", "advice", isError), toolCallId: id ?? `q${++seq}` });
+
+	it("does not count a response whose tool calls are all consult as a step", () => {
+		const base = [user("Fix it", 10), calls(call("bash", {})), ok()];
+		const consulted = [...base, assistant([text("Let me ask."), call("consult", { question: "?" })], { stopReason: "toolUse" }), consultResult()];
+		expect(analyzeTurn(consulted)).toMatchObject({ step: 1, lastToolResultStep: 1 });
+		expect(analyzeTurn(consulted).step).toBe(analyzeTurn(base).step);
+		// A mixed response is a step.
+		expect(analyzeTurn([...base, calls(call("consult", {}), call("read", { path: "a" })), consultResult(), ok()]).step).toBe(2);
+	});
+
+	it("does not let consult results make advice stale", () => {
+		const a = analyzeTurn([user("Fix it", 10), calls(call("consult", {})), consultResult()]);
+		expect(a).toMatchObject({ step: 0, lastToolResultStep: 0 });
+	});
+
+	it("skips consult results in the error streak, successful or failed", () => {
+		const messages = [user("Fix it", 10), calls(call("bash", {})), err("e1"), calls(call("consult", {})), consultResult(false), calls(call("bash", { x: 1 })), err("e2")];
+		expect(analyzeTurn(messages)).toMatchObject({ consecutiveErrors: 2, errorStreakId: "e1" });
+		expect(analyzeTurn([user("Fix it", 10), calls(call("bash", {})), ok(), calls(call("consult", {})), consultResult(true)]).consecutiveErrors).toBe(0);
+	});
+
+	it("skips consult calls when fingerprinting repeats", () => {
+		const same = () => call("bash", { command: "npm test" });
+		const first = same();
+		const messages = [user("Fix it", 10), calls(first), err(), calls(call("consult", {})), consultResult(), calls(same()), err(), calls(same()), err()];
+		expect(analyzeTurn(messages)).toMatchObject({ repeatedCalls: 3, repeatStreakId: first.id });
+		const consults = [user("Fix it", 10), calls(call("consult", { question: "a" })), consultResult(), calls(call("consult", { question: "a" })), consultResult()];
+		expect(analyzeTurn(consults).repeatedCalls).toBe(0);
+	});
+});
+
 describe("analyzeTurn", () => {
 	it("is step 0 right after the user message", () => {
 		const a = analyzeTurn([system("sys"), user("Fix it", 10)]);

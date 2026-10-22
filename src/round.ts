@@ -9,7 +9,8 @@ import type { AdvisorConfig, PresetConfig, ThinkingLevel } from "./schema.ts";
 import { budgetChars } from "./trim.ts";
 import type { TriggerReason } from "./triggers.ts";
 import {
-	ADVICE_REQUEST_BLOCKS,
+	adviceRequest,
+	adviceRequestBlocks,
 	buildNativeView,
 	buildTextView,
 	nativeInstruction,
@@ -20,10 +21,15 @@ import {
 
 export const RECORD_ENTRY = "moa";
 
+/** A trigger, or the actor's `consult` tool call. */
+export type RoundReason = TriggerReason | "consult";
+
 export interface MoaRecord {
 	preset: string;
-	/** Which trigger started the round. */
-	reason: TriggerReason;
+	/** What started the round. */
+	reason: RoundReason;
+	/** The actor's question (consult only). */
+	question?: string;
 	/** Turn key (see `analyzeTurn`). */
 	turn: string;
 	step: number;
@@ -50,7 +56,9 @@ export interface RoundInput<M extends ModelLike> {
 	projection?: RequestProjection;
 	/** Rendered project context files, for text views (see `projectInstructions`). */
 	projectInstructions?: string;
-	reason: TriggerReason;
+	reason: RoundReason;
+	/** The actor's `consult` question, appended to the advice request. */
+	question?: string;
 	turn: string;
 	step: number;
 }
@@ -60,6 +68,7 @@ export interface RoundOutput {
 	results: AdvisorResult[];
 	/** `signal` was aborted during the round: never cache or inject its advice. */
 	interrupted: boolean;
+	record: MoaRecord;
 }
 
 /**
@@ -98,7 +107,10 @@ export function advisorView<M extends ModelLike>(
 	messages: readonly AgentMessage[],
 	advisor: { model: M; config: AdvisorConfig; slot?: number },
 	context: {
-		input: Pick<RoundInput<M>, "actor" | "config" | "projectInstructions" | "sessionId" | "actorThinking" | "thinkingBudgets" | "projection">;
+		input: Pick<
+			RoundInput<M>,
+			"actor" | "config" | "projectInstructions" | "sessionId" | "actorThinking" | "thinkingBudgets" | "projection" | "question"
+		>;
 		preset: PresetConfig;
 		readPromptFile?: PromptFileReader;
 	},
@@ -107,8 +119,9 @@ export function advisorView<M extends ModelLike>(
 	const { config } = advisor;
 	const view = selectView(preset.context.view, advisor.model, input.actor);
 	const prompt = (base: string) => assemblePrompt(config.role, config, input.config.roles, context.readPromptFile, base);
+	const request = adviceRequest(input.question);
 	if (view === "native") {
-		const instruction = nativeInstruction(prompt(NATIVE_BASE_RULES));
+		const instruction = nativeInstruction(prompt(NATIVE_BASE_RULES), request);
 		return {
 			view,
 			context: buildNativeView(messages, instruction, input.projection),
@@ -125,11 +138,12 @@ export function advisorView<M extends ModelLike>(
 		toolResultChars: preset.context.toolResultChars,
 		budgetChars: budgetChars(advisor.model.contextWindow, config.maxTokens, config.thinking),
 		pin: preset.context.pin,
+		request,
 	});
 	return {
 		view,
 		context: textView,
-		tailTexts: ADVICE_REQUEST_BLOCKS,
+		tailTexts: adviceRequestBlocks(request),
 		thinking: config.thinking,
 		sessionId: advisorSessionId(input.sessionId, advisor.slot ?? 0),
 	};
@@ -137,7 +151,8 @@ export function advisorView<M extends ModelLike>(
 
 export interface RoundDeps<M> {
 	complete: CompleteFn<M>;
-	appendEntry: (customType: string, data: MoaRecord) => void;
+	/** Saves the round as a session record; omitted for `consult`, whose tool result carries it. */
+	appendEntry?: (customType: string, data: MoaRecord) => void;
 	readPromptFile?: PromptFileReader;
 	debug?: (line: string) => void;
 	rng?: () => number;
@@ -149,7 +164,7 @@ export function appendAdvice(messages: readonly AgentMessage[], text: string, ti
 	return [...messages, { role: "user", content: [{ type: "text", text }], timestamp }];
 }
 
-/** Runs and records one advisor round; undefined when the preset has no usable advisors. */
+/** Runs (and with `deps.appendEntry`, records) one advisor round; undefined when the preset has no usable advisors. */
 export async function runRound<M extends ModelLike>(input: RoundInput<M>, deps: RoundDeps<M>): Promise<RoundOutput | undefined> {
 	const debug = deps.debug ?? (() => {});
 	const now = deps.now ?? Date.now;
@@ -188,13 +203,20 @@ export async function runRound<M extends ModelLike>(input: RoundInput<M>, deps: 
 	const results = await runAdvisors(requests, { complete: deps.complete, signal: input.signal, timeoutMs: preset.timeoutMs, now });
 
 	const interrupted = input.signal?.aborted === true;
-	const record: MoaRecord = { preset: input.presetName, reason: input.reason, turn: input.turn, step: input.step, advisors: results };
+	const record: MoaRecord = {
+		preset: input.presetName,
+		reason: input.reason,
+		...(input.question !== undefined && { question: input.question }),
+		turn: input.turn,
+		step: input.step,
+		advisors: results,
+	};
 	if (interrupted) record.interrupted = true;
 	try {
-		deps.appendEntry(RECORD_ENTRY, record);
+		deps.appendEntry?.(RECORD_ENTRY, record);
 	} catch (error) {
 		debug(`record failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
 	debug(`round ${input.presetName} (${input.reason}, step ${input.step}): ${results.map((r) => `${r.label}=${r.ok ? "ok" : r.error}`).join(" ")}`);
-	return { results, interrupted };
+	return { results, interrupted, record };
 }

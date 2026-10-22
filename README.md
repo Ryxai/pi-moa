@@ -59,8 +59,28 @@ compaction summarises away the turn's user message mid-turn, the turn's advice i
 marked stale; `on_failure` and `every_step` keep working, and `every_n` counts steps from the
 summary.
 
-The `consult` tool, the advice renderer, `moa/<preset>` virtual models and one-shot `/moa <prompt>`
-are planned.
+**The `consult` tool:** while MoA is on and the preset has `consult.enabled` (and `maxPerTurn` > 0),
+the actor gets a `consult` tool with an optional `question`. It runs the preset's advisors (same
+views, roles, trimming and timeouts as a round) on the actor's latest request plus the response
+that made the call, with "The acting agent asks: …" added to the advice request, and returns the
+framed advice as the tool result. Unlike per-request advice, this result stays in the
+conversation. Text views show earlier consult results as `⟨result consult: advice omitted⟩`, so
+advisors still never see past advice; native views send the actor's transcript unchanged (to
+share its prompt cache), so there they do see it. Every call counts toward `maxPerTurn`, including
+failed and aborted ones; after that it returns "consult limit reached for this turn (N)". If every
+advisor fails it returns an error. The round is kept in the tool result's `details` (not as a
+`moa` entry), and the advisors' usage is reported on the result, so pi's session totals include it.
+
+Consult calls are invisible to triggers: a response whose tool calls are all `consult` is not a
+step (so `every_step`/`every_n` do not fire again right after it, and the step's advice is reused),
+consult calls and results do not count toward `on_failure` streaks (nor break or reset them), and
+consult results do not make cached advice stale. The tool is added on `/moa on`, a preset switch,
+`/moa reload` and session restore, and removed on `/moa off`, a preset switch, `/moa reload`, or at
+the next run start after a restore turned it off. Each change alters the actor's tool set, which pi
+records as a transition in the transcript; providers that cannot express it get a full checkpoint,
+which can miss the prompt cache once.
+
+The advice renderer, `moa/<preset>` virtual models and one-shot `/moa <prompt>` are planned.
 
 **Prompt caching:** the advice changes every request, so MoA moves the conversation cache marker
 (Anthropic `cache_control`, `cache_control` on OpenRouter `anthropic/*` chat completions, Bedrock

@@ -68,6 +68,11 @@ Separately, a `before_provider_request` hook moves the cache marker off the advi
 - Actor guidance, based on Anthropic's advisor guidance: consult before substantive work, when stuck, before
   changing approach, and before declaring done.
 - Reports advisor `usage` in its result so pi's session totals include it.
+- *Built (step 6):* advisors see the actor's latest request plus the calling response. Text views
+  render earlier consult results as `⟨result consult: advice omitted⟩`; native views keep the
+  transcript byte-identical (cache sharing), so they are the one place advisors see past advice.
+  Consult-only responses are not steps; consult calls/results are ignored by failure streaks and
+  staleness. The round goes in the result's `details`, not a `moa` entry.
 
 ## Context (what advisors see)
 

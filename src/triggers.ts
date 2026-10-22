@@ -1,5 +1,6 @@
 import { FRAMING_HEADER } from "./framing.ts";
 import type { PresetConfig, Trigger } from "./schema.ts";
+import { CONSULT_TOOL } from "./tool-names.ts";
 import type { AgentMessage } from "./view.ts";
 
 export interface TurnAnalysis {
@@ -10,7 +11,10 @@ export interface TurnAnalysis {
 	turnKey: string;
 	/** The turn's user message is gone and `turnKey` names a compaction summary. */
 	compacted: boolean;
-	/** Completed assistant responses since that message (error/aborted ones excluded). */
+	/**
+	 * Completed assistant responses since that message (error/aborted ones excluded, and those whose
+	 * tool calls are all `consult`, so a consult does not advance the step).
+	 */
 	step: number;
 	/**
 	 * Most recent tool results in this turn that errored in a row; any success resets it. Within a
@@ -54,7 +58,9 @@ type User = Extract<AgentMessage, { role: "user" }>;
  * Where the request is in the current turn. A turn starts at the last `user` message (typed
  * prompts, steering and follow-up messages); extension messages (`custom`, e.g. `sendMessage`),
  * `!` commands, summaries and our own advice do not start one. Error/aborted responses are
- * skipped as pi's providers skip them, so an auto-retry maps to the same step.
+ * skipped as pi's providers skip them, so an auto-retry maps to the same step. `consult` calls and
+ * results are invisible to the step count, failure streaks and staleness: they are the actor asking
+ * for advice, not progress or failure.
  */
 export function analyzeTurn(messages: readonly AgentMessage[]): TurnAnalysis {
 	let start = messages.length;
@@ -67,11 +73,11 @@ export function analyzeTurn(messages: readonly AgentMessage[]): TurnAnalysis {
 	let lastToolResultStep = 0;
 	const calls: { id: string; fingerprint: string }[] = [];
 	for (const message of turn) {
-		if (message.role === "toolResult") lastToolResultStep = step;
-		if (message.role !== "assistant" || isFailedResponse(message)) continue;
+		if (message.role === "toolResult" && message.toolName !== CONSULT_TOOL) lastToolResultStep = step;
+		if (message.role !== "assistant" || isFailedResponse(message) || isConsultOnly(message)) continue;
 		step++;
 		for (const block of message.content) {
-			if (block.type === "toolCall") calls.push({ id: block.id, fingerprint: callFingerprint(block.name, block.arguments) });
+			if (block.type === "toolCall" && block.name !== CONSULT_TOOL) calls.push({ id: block.id, fingerprint: callFingerprint(block.name, block.arguments) });
 		}
 	}
 
@@ -79,7 +85,7 @@ export function analyzeTurn(messages: readonly AgentMessage[]): TurnAnalysis {
 	let errorStreakId: string | undefined;
 	for (let i = turn.length - 1; i >= 0; i--) {
 		const message = turn[i]!;
-		if (message.role !== "toolResult") continue;
+		if (message.role !== "toolResult" || message.toolName === CONSULT_TOOL) continue;
 		if (!message.isError) break;
 		consecutiveErrors++;
 		errorStreakId = message.toolCallId;
@@ -162,6 +168,11 @@ export function stableJson(value: unknown): string {
 
 function isRealUser(message: AgentMessage): boolean {
 	return message.role === "user" && !contentText(message.content).startsWith(FRAMING_HEADER);
+}
+
+function isConsultOnly(message: Assistant): boolean {
+	const calls = message.content.filter((block) => block.type === "toolCall");
+	return calls.length > 0 && calls.every((call) => call.name === CONSULT_TOOL);
 }
 
 function isFailedResponse(message: Assistant): boolean {

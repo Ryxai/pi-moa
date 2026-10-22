@@ -13,6 +13,7 @@ import { convertToLlm, type ContextWithSystemEvent } from "@earendil-works/pi-co
 import type { ModelLike } from "./config-resolve.ts";
 import type { ContextView, PinItem } from "./schema.ts";
 import { head, truncateMiddle } from "./text.ts";
+import { CONSULT_TOOL } from "./tool-names.ts";
 import { trimEntries } from "./trim.ts";
 
 export type AgentMessage = ContextWithSystemEvent["messages"][number];
@@ -28,8 +29,19 @@ export const ADVICE_REQUEST =
  */
 const BLOCK_SEPARATOR = "\n\n";
 
-/** The exact texts the advice-request block can have (its own message, or appended to a user turn). */
-export const ADVICE_REQUEST_BLOCKS: readonly string[] = [ADVICE_REQUEST, `${BLOCK_SEPARATOR}${ADVICE_REQUEST}`];
+/** The advice request, with the acting agent's question for a `consult` call. */
+export function adviceRequest(question?: string): string {
+	return question ? `${ADVICE_REQUEST}\n\nThe acting agent asks: ${question}` : ADVICE_REQUEST;
+}
+
+/** The exact texts a text view's advice-request block can have (its own message, or appended to a user turn). */
+export function adviceRequestBlocks(request: string): readonly string[] {
+	return [request, `${BLOCK_SEPARATOR}${request}`];
+}
+
+export const ADVICE_REQUEST_BLOCKS = adviceRequestBlocks(ADVICE_REQUEST);
+
+const CONSULT_OMITTED = "advice omitted";
 
 const AGENT_FIRST = "(The transcript starts with the agent.)";
 
@@ -40,8 +52,8 @@ export function selectView(view: ContextView, advisor: ModelLike, actor: ModelLi
 }
 
 /** The native view's trailing user message: advisor instructions, then the advice request. */
-export function nativeInstruction(prompt: string): string {
-	return `${prompt}\n\n${ADVICE_REQUEST}`;
+export function nativeInstruction(prompt: string, request = ADVICE_REQUEST): string {
+	return `${prompt}\n\n${request}`;
 }
 
 /**
@@ -120,6 +132,7 @@ export interface Entry {
 	/** Tool calls of an assistant message. */
 	calls?: readonly ToolCall[];
 	toolCallId?: string;
+	toolName?: string;
 	isError?: boolean;
 }
 
@@ -137,6 +150,8 @@ export interface TextViewOptions {
 	/** Size limit for the whole view in characters (see `budgetChars`); omitted = no trimming. */
 	budgetChars?: number;
 	pin?: readonly PinItem[];
+	/** The closing advice request (see `adviceRequest`); default `ADVICE_REQUEST`. */
+	request?: string;
 }
 
 /**
@@ -145,15 +160,16 @@ export interface TextViewOptions {
  * message after an assistant turn), so every earlier block is byte-identical across steps.
  */
 export function buildTextView(messages: readonly AgentMessage[], options: TextViewOptions): Context {
+	const request = options.request ?? ADVICE_REQUEST;
 	let entries = renderEntries(messages, options.toolResultChars);
 	if (options.budgetChars !== undefined) {
-		const fixed = options.systemPrompt.length + BLOCK_SEPARATOR.length + ADVICE_REQUEST.length;
+		const fixed = options.systemPrompt.length + BLOCK_SEPARATOR.length + request.length;
 		entries = trimEntries(entries, { budget: options.budgetChars, fixed, pin: options.pin ?? [] });
 	}
 	const turns = mergeEntries(entries);
 	const last = turns.at(-1);
-	if (last?.role === "user") last.blocks.push(`${BLOCK_SEPARATOR}${ADVICE_REQUEST}`);
-	else turns.push({ role: "user", blocks: [ADVICE_REQUEST], timestamp: last?.timestamp ?? 0 });
+	if (last?.role === "user") last.blocks.push(`${BLOCK_SEPARATOR}${request}`);
+	else turns.push({ role: "user", blocks: [request], timestamp: last?.timestamp ?? 0 });
 	return { systemPrompt: options.systemPrompt, messages: turns.map(toMessage) };
 }
 
@@ -174,7 +190,7 @@ export function renderEntries(messages: readonly AgentMessage[], toolResultChars
 			if (!rendered) continue;
 			const entry: Entry = { ...rendered, timestamp: message.timestamp, source: source.role };
 			if (message.role === "assistant") entry.calls = message.content.filter((block) => block.type === "toolCall");
-			if (message.role === "toolResult") Object.assign(entry, { toolCallId: message.toolCallId, isError: message.isError });
+			if (message.role === "toolResult") Object.assign(entry, { toolCallId: message.toolCallId, toolName: message.toolName, isError: message.isError });
 			entries.push(entry);
 		}
 	}
@@ -223,7 +239,8 @@ function renderMessage(message: Message, toolResultChars: number): { role: Turn[
 			// messages instead of growing the agent's turn (adapters such as openai-completions join
 			// an assistant message's text parts into one string, which would defeat prompt caching).
 			role = "user";
-			const body = truncateMiddle(renderContent(message.content), toolResultChars);
+			// Advisors never see earlier advice: a consult result is the advice itself.
+			const body = message.toolName === CONSULT_TOOL ? CONSULT_OMITTED : truncateMiddle(renderContent(message.content), toolResultChars);
 			text = `⟨result ${message.toolName}${message.isError ? " (error)" : ""}: ${body}⟩`;
 			break;
 		}

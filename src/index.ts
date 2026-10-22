@@ -3,17 +3,18 @@ import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI, type ExtensionContext 
 import { adviceText, cacheForTurn, decideRound, storeRound, type TurnCache } from "./advice-cache.ts";
 import { moveCacheMarker } from "./cache.ts";
 import { completeMoaArgs, parseMoaArgs } from "./commands.ts";
+import { CONSULT_DESCRIPTION, CONSULT_TOOL, ConsultCounter, consultParameters, consultWanted, executeConsult, syncConsultTool } from "./consult.ts";
 import { CONFIG_FILE, loadConfig, writeDefaultConfig, type LoadedConfig } from "./config-io.ts";
 import { resolvePreset } from "./config-resolve.ts";
-import { formatIssues, getPreset, issuesFor } from "./config.ts";
+import { formatIssues, getPreset, issuesFor, type PresetConfig } from "./config.ts";
 import { createDebugLog, debugLogPath } from "./debug.ts";
 import { projectInstructions, type PromptOptionsLike } from "./roles.ts";
-import { appendAdvice, runRound } from "./round.ts";
+import { appendAdvice, runRound, type RoundDeps, type RoundInput } from "./round.ts";
 import { OFF, reconstructState, STATE_ENTRY, type MoaState } from "./state.ts";
 import type { ThinkingBudgets } from "@earendil-works/pi-ai";
 import type { ThinkingLevel } from "./schema.ts";
 import { analyzeTurn } from "./triggers.ts";
-import type { RequestProjection } from "./view.ts";
+import type { AgentMessage, RequestProjection } from "./view.ts";
 
 /** How many recent advice texts the cache-marker hook recognises. */
 const TRACKED_ADVICE = 3;
@@ -42,6 +43,9 @@ export default function moa(pi: ExtensionAPI): void {
 	 * context files for text views.
 	 */
 	let promptOptions: PromptOptionsLike | undefined;
+	/** The latest actor request's messages before our advice: what a `consult` call's advisors see. */
+	let lastRequest: readonly AgentMessage[] | undefined;
+	let consults = new ConsultCounter();
 
 	async function reload(ctx: ExtensionContext): Promise<LoadedConfig> {
 		loaded = await loadConfig({
@@ -73,6 +77,26 @@ export default function moa(pi: ExtensionAPI): void {
 			persisted = next;
 		}
 		updateStatus(ctx);
+		syncTools();
+	}
+
+	function activePreset(): PresetConfig | undefined {
+		return state.enabled && state.preset && loaded ? getPreset(loaded.config, state.preset) : undefined;
+	}
+
+	/**
+	 * Declares `consult` to the actor only while the active preset allows it (changes the actor's
+	 * tool set). With `addOnly`, an unwanted active tool is left for the next run start: removing a
+	 * tool drops pi's pending restored tools (e.g. MCP tools still connecting), which pi itself
+	 * clears at run start (agent-session.js setActiveToolsByName, prompt).
+	 */
+	function syncTools(addOnly = false): void {
+		try {
+			const want = consultWanted(activePreset());
+			if (want || !addOnly) syncConsultTool(pi, want);
+		} catch (error) {
+			debug(`consult activation failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
 	}
 
 	function updateStatus(ctx: ExtensionContext): void {
@@ -105,6 +129,8 @@ export default function moa(pi: ExtensionAPI): void {
 		injected = [];
 		turnCache = undefined;
 		promptOptions = undefined;
+		lastRequest = undefined;
+		consults = new ConsultCounter();
 		const config = await reload(ctx);
 		for (const note of config.notes) notify(ctx, `MoA: ${note}`, "warning");
 		persisted = reconstructState(ctx.sessionManager.getBranch());
@@ -117,6 +143,7 @@ export default function moa(pi: ExtensionAPI): void {
 			}
 		}
 		updateStatus(ctx);
+		syncTools(true);
 	}
 
 	pi.on("session_start", (_event, ctx) => restore(ctx));
@@ -145,12 +172,48 @@ export default function moa(pi: ExtensionAPI): void {
 		}
 	}
 
+	function roundInput(
+		ctx: ExtensionContext,
+		config: LoadedConfig,
+		presetName: string,
+		messages: readonly AgentMessage[],
+		signal: AbortSignal | undefined,
+		round: Pick<RoundInput<NonNullable<ExtensionContext["model"]>>, "reason" | "turn" | "step" | "question">,
+	): RoundInput<NonNullable<ExtensionContext["model"]>> {
+		return {
+			messages,
+			config: config.config,
+			presetName,
+			models: ctx.modelRegistry,
+			actor: ctx.model,
+			signal,
+			sessionId: sessionIdOf(ctx),
+			projectInstructions: projectInstructions(promptOptions),
+			...actorSettings(),
+			actorThinking: actorThinking(),
+			...round,
+		};
+	}
+
+	/** Round dependencies; `record` saves the round as a `moa` entry (not for consult, see consult.ts). */
+	function roundDeps(ctx: ExtensionContext, config: LoadedConfig, record: boolean): RoundDeps<NonNullable<ExtensionContext["model"]>> {
+		return {
+			complete: (model, context, options) => ctx.modelRegistry.streamSimple(model, context, options).result(),
+			...(record && { appendEntry: (type: string, data: unknown) => pi.appendEntry(type, data) }),
+			readPromptFile: (path) => (Object.hasOwn(config.promptFiles, path) ? config.promptFiles[path] : undefined),
+			debug,
+		};
+	}
+
 	pi.on("before_agent_start", (event) => {
 		promptOptions = event.systemPromptOptions;
+		syncTools();
 	});
 
 	pi.on("context_with_system", async (event, ctx) => {
 		contextCalls++;
+		// Copied so later handlers mutating the request in place cannot change it.
+		lastRequest = event.messages.map((message) => ({ ...message }));
 		const last = event.messages.at(-1);
 		debug(
 			`context_with_system #${contextCalls} enabled=${state.enabled} preset=${state.preset ?? "-"} messages=${event.messages.length} last=${last?.role}`,
@@ -170,27 +233,12 @@ export default function moa(pi: ExtensionAPI): void {
 			if (decision.reason) {
 				setWorking(ctx, "MoA: advisors…");
 				const round = await runRound(
-					{
-						messages: event.messages,
-						config: config.config,
-						presetName: state.preset,
-						models: ctx.modelRegistry,
-						actor: ctx.model,
-						signal: ctx.signal,
-						sessionId: sessionIdOf(ctx),
-						projectInstructions: projectInstructions(promptOptions),
-						...actorSettings(),
-						actorThinking: actorThinking(),
+					roundInput(ctx, config, state.preset, event.messages, ctx.signal, {
 						reason: decision.reason,
 						turn: analysis.turnKey,
 						step: analysis.step,
-					},
-					{
-						complete: (model, context, options) => ctx.modelRegistry.streamSimple(model, context, options).result(),
-						appendEntry: (type, data) => pi.appendEntry(type, data),
-						readPromptFile: (path) => (Object.hasOwn(config.promptFiles, path) ? config.promptFiles[path] : undefined),
-						debug,
-					},
+					}),
+					roundDeps(ctx, config, true),
 				)
 					.catch((error: unknown) => {
 						debug(`round failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`);
@@ -224,6 +272,34 @@ export default function moa(pi: ExtensionAPI): void {
 		} catch {
 			return undefined;
 		}
+	});
+
+	// Registered inactive; `syncTools` declares it while MoA is on with a preset that allows it.
+	pi.registerTool({
+		name: CONSULT_TOOL,
+		label: "Consult advisors",
+		description: CONSULT_DESCRIPTION,
+		parameters: consultParameters,
+		defaultActive: false,
+		execute: (toolCallId, params, signal, onUpdate, ctx) => {
+			const preset = activePreset();
+			const config = loaded;
+			const presetName = state.preset;
+			return executeConsult(
+				params,
+				{
+					settings: preset?.consult,
+					snapshot: lastRequest,
+					caller: callingResponse(ctx, toolCallId),
+					counter: consults,
+					run: async ({ messages, question, turn, step }) =>
+						config && presetName
+							? runRound(roundInput(ctx, config, presetName, messages, signal ?? ctx.signal, { reason: "consult", question, turn, step }), roundDeps(ctx, config, false))
+							: undefined,
+				},
+				onUpdate,
+			);
+		},
 	});
 
 	pi.registerCommand("moa", {
@@ -260,8 +336,10 @@ export default function moa(pi: ExtensionAPI): void {
 					if (errors.length > 0) {
 						setState(OFF, ctx);
 						notify(ctx, `MoA turned off: preset "${active}" is no longer usable:\n${errors.join("\n")}`, "warning");
+					} else {
+						updateStatus(ctx);
+						syncTools();
 					}
-					updateStatus(ctx);
 					return;
 				}
 				case "init": {
@@ -275,6 +353,24 @@ export default function moa(pi: ExtensionAPI): void {
 			}
 		},
 	});
+}
+
+/**
+ * The actor's response that made tool call `toolCallId`. pi persists it on `message_end`, which it
+ * awaits before running the response's tools.
+ */
+function callingResponse(ctx: ExtensionContext, toolCallId: string): AgentMessage | undefined {
+	try {
+		const branch = ctx.sessionManager.getBranch();
+		for (let i = branch.length - 1; i >= 0; i--) {
+			const entry = branch[i]!;
+			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+			if (entry.message.content.some((block) => block.type === "toolCall" && block.id === toolCallId)) return entry.message;
+		}
+	} catch {
+		// No session access: advisors see the request only.
+	}
+	return undefined;
 }
 
 function sessionIdOf(ctx: ExtensionContext): string | undefined {

@@ -18,6 +18,7 @@
 import type { ToolCall } from "@earendil-works/pi-ai";
 import type { PinItem, ThinkingLevel } from "./schema.ts";
 import { truncateMiddle } from "./text.ts";
+import { CONSULT_TOOL } from "./tool-names.ts";
 import type { Entry } from "./view.ts";
 
 export const CHARS_PER_TOKEN = 3;
@@ -93,7 +94,7 @@ export function pinnedIndices(entries: readonly Entry[], pin: readonly PinItem[]
 		add(task >= 0 ? task : entries.findLastIndex((e) => e.source === "compactionSummary"));
 	}
 	if (pin.includes("latestError")) {
-		const error = entries.findLastIndex((e) => e.source === "toolResult" && e.isError === true);
+		const error = entries.findLastIndex((e) => e.source === "toolResult" && e.isError === true && e.toolName !== CONSULT_TOOL);
 		if (error >= 0) {
 			add(error);
 			add(entries.findLastIndex((e, i) => i < error && e.calls?.some((call) => call.id === entries[error]!.toolCallId)));

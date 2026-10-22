@@ -3,12 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Context } from "@earendil-works/pi-ai";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import moa from "../src/index.ts";
 import { STALE_NOTE } from "../src/framing.ts";
 import { RECORD_ENTRY, type MoaRecord } from "../src/round.ts";
 import { STATE_ENTRY, type EntryLike } from "../src/state.ts";
-import { assistant, system, text, toolResult, user } from "./fixtures.ts";
+import { ADVICE_REQUEST } from "../src/view.ts";
+import { assistant, system, text, toolResult, user, usage } from "./fixtures.ts";
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 type Note = { message: string; type: string };
@@ -27,6 +28,8 @@ interface Harness {
 	llm: { reply: (model: { id: string }) => Promise<unknown>; options: unknown[]; contexts: Context[] };
 	working: (string | undefined)[];
 	piState: { blockImages: boolean; thinking: string };
+	/** Registered tools by name, the active set, and every `setActiveTools` call. */
+	tools: { registered: Map<string, ToolDefinition>; active: string[]; sets: string[][] };
 }
 
 const model = { provider: "anthropic", id: "sonnet" };
@@ -47,7 +50,17 @@ async function setup(): Promise<Harness> {
 	const working: (string | undefined)[] = [];
 	const piState = { blockImages: false, thinking: "medium" };
 	let command: { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> } | undefined;
+	const tools = { registered: new Map<string, ToolDefinition>(), active: ["read", "bash", "edit", "write"], sets: [] as string[][] };
 	const pi = {
+		registerTool: (tool: ToolDefinition) => {
+			tools.registered.set(tool.name, tool);
+			if (tool.defaultActive !== false) tools.active.push(tool.name);
+		},
+		getActiveTools: () => [...tools.active],
+		setActiveTools: (names: string[]) => {
+			tools.sets.push(names);
+			tools.active = [...names];
+		},
 		on: (event: string, handler: Handler) => handlers.set(event, handler),
 		registerCommand: (_name: string, options: typeof command) => {
 			command = options;
@@ -92,6 +105,7 @@ async function setup(): Promise<Harness> {
 		llm,
 		working,
 		piState,
+		tools,
 	};
 }
 
@@ -640,5 +654,164 @@ describe("toggling clears the turn's advice", () => {
 		expect(await advice(1)).toContain("Check the failing test first.");
 		for (const command of commands) await h.run(command);
 		expect(await advice(2)).toBeUndefined();
+	});
+});
+
+describe("consult tool", () => {
+	const BASE = ["read", "bash", "edit", "write"];
+	const consult = () => h.tools.registered.get("consult")!;
+	const transcript = (prompt = "Fix the test", ts = 100) => [system("You are pi."), user(prompt, ts)];
+	const records = () => h.entries.filter((e) => e.customType === RECORD_ENTRY);
+	const call = (params: { question?: string } = {}, signal?: AbortSignal, onUpdate?: (u: unknown) => void) =>
+		consult().execute("t1", params, signal, onUpdate, h.ctx as never);
+	const usePresets = async (presets: Record<string, unknown>) => {
+		await writeGlobal(h, { presets });
+		await h.run("reload");
+	};
+	const lastText = (c: Context) => (c.messages.at(-1)!.content as { text: string }[]).at(-1)!.text;
+
+	it("is registered inactive and not activated while off", () => {
+		expect(consult()).toMatchObject({ name: "consult", defaultActive: false });
+		expect(consult().description).toContain("verify");
+		expect(h.tools.active).toEqual(BASE);
+		expect(h.tools.sets).toEqual([]);
+	});
+
+	it("is active only while on with a preset that allows it, leaving other tools alone", async () => {
+		await usePresets({ shy: { consult: { enabled: false } }, capped: { consult: { maxPerTurn: 0 } } });
+		h.tools.active = ["read", "mcp_docs"];
+		await h.run("on");
+		expect(h.tools.active).toEqual(["read", "mcp_docs", "consult"]);
+		await h.run("on shy");
+		expect(h.tools.active).toEqual(["read", "mcp_docs"]);
+		await h.run("on capped");
+		expect(h.tools.active).toEqual(["read", "mcp_docs"]);
+		await h.run("on solo");
+		expect(h.tools.active).toEqual(["read", "mcp_docs", "consult"]);
+		await h.run("off");
+		expect(h.tools.active).toEqual(["read", "mcp_docs"]);
+		// No change to the active set when consult stays inactive (shy → capped).
+		expect(h.tools.sets).toHaveLength(4);
+	});
+
+	it("follows /moa reload when the preset's consult setting changes", async () => {
+		await h.run("on");
+		expect(h.tools.active).toContain("consult");
+		await usePresets({ solo: { consult: { enabled: false } } });
+		expect(h.tools.active).toEqual(BASE);
+	});
+
+	it("is added on restore, and removed at the next run start rather than during restore", async () => {
+		h.entries.push({ type: "custom", customType: STATE_ENTRY, data: { enabled: true, preset: "solo" } });
+		await h.emit("session_start");
+		expect(h.tools.active).toEqual([...BASE, "consult"]);
+		// Restored as off: removing now would drop pi's pending restored tools.
+		h.auth.ok = false;
+		const sets = h.tools.sets.length;
+		await h.emit("session_start");
+		expect(h.tools.sets).toHaveLength(sets);
+		await h.emit("before_agent_start", { type: "before_agent_start", systemPromptOptions: {} });
+		expect(h.tools.active).toEqual(BASE);
+		h.entries.push({ type: "custom", customType: STATE_ENTRY, data: { enabled: false } });
+		h.tools.active = [...BASE, "consult"];
+		await h.emit("session_tree");
+		expect(h.tools.active).toContain("consult");
+		await h.emit("before_agent_start", { type: "before_agent_start", systemPromptOptions: {} });
+		expect(h.tools.active).toEqual(BASE);
+	});
+
+	it("runs the advisors on the latest request before advice, with the question, as a tool result", async () => {
+		let n = 0;
+		h.llm.reply = async () => assistant([text(`advice ${++n}`)], { usage: usage(0.02) });
+		await h.run("on");
+		const request = transcript();
+		await h.emit("context_with_system", { type: "context_with_system", messages: request });
+		// pi persists the calling response before running its tools.
+		const caller = assistant([text("I think the fixture is stale."), { type: "toolCall" as const, id: "t1", name: "consult", arguments: {} }], { stopReason: "toolUse" });
+		h.entries.push({ type: "message", message: caller } as EntryLike);
+		const before = h.entries.length;
+		const updates: unknown[] = [];
+		const out = await call({ question: "Is the fixture wrong?" }, undefined, (u) => updates.push(u));
+
+		const context = h.llm.contexts.at(-1)!;
+		expect(context.messages.slice(0, -1)).toEqual([...request, caller]);
+		expect(lastText(context).endsWith(`${ADVICE_REQUEST}\n\nThe acting agent asks: Is the fixture wrong?`)).toBe(true);
+		expect(out.isError).toBeUndefined();
+		expect(out.content).toEqual([text(expect.stringContaining("Advisor A (advisor):\nadvice 2"))]);
+		expect(out.details).toMatchObject({ preset: "solo", reason: "consult", question: "Is the fixture wrong?", step: 0, advisors: [{ ok: true, text: "advice 2" }] });
+		expect(out.usage?.cost.total).toBeCloseTo(0.02);
+		expect(updates).toHaveLength(1);
+		expect(h.entries).toHaveLength(before);
+	});
+
+	it("uses the text view for other models, as rounds do", async () => {
+		await usePresets({ solo: { context: { view: "text" } } });
+		await h.run("on");
+		await h.emit("context_with_system", { type: "context_with_system", messages: transcript() });
+		await call({ question: "Why?" });
+		const context = h.llm.contexts.at(-1)!;
+		expect(context.systemPrompt).toBeDefined();
+		expect(lastText(context)).toBe(`\n\n${ADVICE_REQUEST}\n\nThe acting agent asks: Why?`);
+	});
+
+	it("leaves the turn's advice cache alone", async () => {
+		let n = 0;
+		h.llm.reply = async () => assistant([text(`advice ${++n}`)]);
+		await h.run("on");
+		const request = transcript();
+		await h.emit("context_with_system", { type: "context_with_system", messages: request });
+		await call();
+		const after = [
+			...request,
+			assistant([{ type: "toolCall" as const, id: "k1", name: "consult", arguments: {} }], { stopReason: "toolUse" }),
+			{ ...toolResult("consult", "advice 2"), toolCallId: "k1" },
+		];
+		const out = (await h.emit("context_with_system", { type: "context_with_system", messages: after })) as { messages: { content: { text: string }[] }[] };
+		expect(out.messages.at(-1)!.content[0]!.text).toContain("advice 1");
+		expect(out.messages.at(-1)!.content[0]!.text).not.toContain(STALE_NOTE);
+		expect(h.llm.options).toHaveLength(2);
+	});
+
+	it("does not advance the step, so every_step reuses the step's advice right after a consult", async () => {
+		let n = 0;
+		h.llm.reply = async () => assistant([text(`advice ${++n}`)]);
+		await usePresets({ solo: { triggers: ["every_step"] } });
+		await h.run("on");
+		const request = transcript();
+		await h.emit("context_with_system", { type: "context_with_system", messages: request });
+		await call();
+		const after = [
+			...request,
+			assistant([text("Asking."), { type: "toolCall" as const, id: "k1", name: "consult", arguments: {} }], { stopReason: "toolUse" }),
+			{ ...toolResult("consult", "advice 2"), toolCallId: "k1" },
+		];
+		const out = (await h.emit("context_with_system", { type: "context_with_system", messages: after })) as { messages: { content: { text: string }[] }[] };
+		const advice = out.messages.at(-1)!.content[0]!.text;
+		expect(advice).toContain("advice 1");
+		expect(advice).not.toContain(STALE_NOTE);
+		expect(h.llm.options).toHaveLength(2);
+	});
+
+	it("caps calls per turn and starts over with a new user message", async () => {
+		await usePresets({ solo: { consult: { maxPerTurn: 1 } } });
+		await h.run("on");
+		await h.emit("context_with_system", { type: "context_with_system", messages: transcript() });
+		await call();
+		const limited = await call();
+		expect(limited).toMatchObject({ content: [text("consult limit reached for this turn (1).")] });
+		expect(limited.isError).toBeUndefined();
+		await h.emit("context_with_system", { type: "context_with_system", messages: transcript("Next", 200) });
+		expect((await call()).content[0]).toMatchObject({ text: expect.stringContaining("Check the failing test first.") });
+	});
+
+	it("errors when every advisor fails or the call is aborted, and without a request", async () => {
+		await h.run("on");
+		expect(await call()).toMatchObject({ isError: true, content: [text("consult is unavailable: no request context.")] });
+		await h.emit("context_with_system", { type: "context_with_system", messages: transcript() });
+		h.llm.reply = async () => assistant([], { stopReason: "error", errorMessage: "rate limited" });
+		expect(await call()).toMatchObject({ isError: true, content: [text("consult failed: no advisor answered (rate limited).")] });
+		const controller = new AbortController();
+		controller.abort();
+		expect(await call({}, controller.signal)).toMatchObject({ isError: true, content: [text("consult aborted.")] });
 	});
 });

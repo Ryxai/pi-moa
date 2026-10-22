@@ -67,6 +67,13 @@ describe("isFileMutation", () => {
 });
 
 describe("trimEntries", () => {
+	it("does not pin a failed consult result as the latest error", () => {
+		const messages = [system("pi"), user("Task"), ...step(1, 1000, { error: true }), ...step(2, 1000, { name: "consult", error: true }), ...step(3, 1000), ...step(4, 1000), ...step(5, 1000)];
+		const all = allText(buildTextView(messages, { ...options, budgetChars: 5000 }));
+		expect(all).toContain("out 1");
+		expect(all).not.toContain("step 2");
+	});
+
 	it("leaves a view under budget untouched", () => {
 		const messages = [system("pi"), user("Task"), ...step(1, 100), ...step(2, 100)];
 		expect(buildTextView(messages, { ...options, budgetChars: 100_000 })).toEqual(buildTextView(messages, options));
