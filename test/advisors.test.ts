@@ -163,7 +163,7 @@ describe("runAdvisors", () => {
 			vi.useFakeTimers();
 			const replies: Promise<AssistantMessage>[] = [Promise.resolve(toolOnly()), new Promise(() => {})];
 			const pending = runAdvisors([native()], { complete: () => replies.shift()!, timeoutMs: 5000 });
-			await vi.advanceTimersByTimeAsync(5000);
+			await vi.advanceTimersByTimeAsync(6000);
 			expect((await pending)[0]).toMatchObject({ ok: false, error: "timeout after 5s", retried: true });
 		});
 	});
@@ -219,7 +219,7 @@ describe("runAdvisors", () => {
 			return new Promise(() => {});
 		};
 		const pending = runAdvisors([request("A", gpt), request("B", sonnet)], { complete, timeoutMs: 5000 });
-		await vi.advanceTimersByTimeAsync(5000);
+		await vi.advanceTimersByTimeAsync(6000);
 		const results = await pending;
 		expect(results[0]).toMatchObject({ ok: false, error: "timeout after 5s" });
 		expect(results[1]).toMatchObject({ ok: true, text: "fast" });
@@ -229,7 +229,7 @@ describe("runAdvisors", () => {
 	it("reports outer aborts, before and during the call", async () => {
 		const outer = new AbortController();
 		const complete: CompleteFn<ModelLike> = () => new Promise(() => {});
-		const pending = runAdvisors([request("A")], { complete, timeoutMs: 60_000, signal: outer.signal });
+		const pending = runAdvisors([request("A")], { complete, timeoutMs: 60_000, signal: outer.signal, abortGraceMs: 10 });
 		outer.abort();
 		expect((await pending)[0]).toMatchObject({ ok: false, error: "aborted" });
 
@@ -237,6 +237,48 @@ describe("runAdvisors", () => {
 		const again = await runAdvisors([request("A")], { complete: calls, timeoutMs: 60_000, signal: outer.signal });
 		expect(again[0]).toMatchObject({ ok: false, error: "aborted" });
 		expect(calls).not.toHaveBeenCalled();
+	});
+
+	/** Like pi's providers: on abort the call resolves with an aborted message carrying the usage so far. */
+	const abortable =
+		(cost: number, delay = 0): CompleteFn<ModelLike> =>
+		(_m, _c, options) =>
+			new Promise((resolve) => {
+				options.signal?.addEventListener("abort", () =>
+					setTimeout(() => resolve(reply("", { stopReason: "aborted", errorMessage: "Request was aborted", usage: usage(cost) })), delay),
+				);
+			});
+
+	it("keeps the partial usage of a timed-out call", async () => {
+		vi.useFakeTimers();
+		let signal: AbortSignal | undefined;
+		const complete: CompleteFn<ModelLike> = (m, c, options) => {
+			signal = options.signal;
+			return abortable(0.004)(m, c, options);
+		};
+		const pending = runAdvisors([request("A")], { complete, timeoutMs: 5000 });
+		await vi.advanceTimersByTimeAsync(5100);
+		const [result] = await pending;
+		expect(signal?.aborted).toBe(true);
+		expect(result).toMatchObject({ ok: false, error: "timeout after 5s", costUsd: 0.004 });
+		expect(result?.usage?.input).toBe(10);
+	});
+
+	it("keeps the partial usage of an outer abort, and gives up on calls that do not settle within the grace", async () => {
+		vi.useFakeTimers();
+		const outer = new AbortController();
+		const pending = runAdvisors([request("A", gpt), request("B", sonnet)], {
+			complete: (m, c, o) => (m === gpt ? abortable(0.01)(m, c, o) : abortable(0.5, 5000)(m, c, o)),
+			timeoutMs: 60_000,
+			signal: outer.signal,
+			abortGraceMs: 1000,
+		});
+		outer.abort();
+		await vi.advanceTimersByTimeAsync(1000);
+		const results = await pending;
+		expect(results[0]).toMatchObject({ ok: false, error: "aborted", costUsd: 0.01 });
+		expect(results[1]).toMatchObject({ ok: false, error: "aborted" });
+		expect(results[1]).not.toHaveProperty("usage");
 	});
 
 	it("runs advisors in parallel and keeps input order", async () => {

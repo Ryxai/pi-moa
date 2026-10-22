@@ -815,3 +815,143 @@ describe("consult tool", () => {
 		expect(await call({}, controller.signal)).toMatchObject({ isError: true, content: [text("consult aborted.")] });
 	});
 });
+
+describe("advisor budget", () => {
+	type Out = { messages: { content: { text: string }[] }[] } | undefined;
+	const records = () => h.entries.filter((e) => e.customType === RECORD_ENTRY).map((e) => e.data as MoaRecord);
+	const calls = () => h.llm.options.length;
+	const transcript = (steps: number, prompt = "Fix the test", ts = 100) => [
+		system("You are pi."),
+		user(prompt, ts),
+		...Array.from({ length: steps }, (_, i) => [
+			assistant([{ type: "toolCall" as const, id: `c${i}`, name: "bash", arguments: { command: `step ${i}` } }], { stopReason: "toolUse" }),
+			{ ...toolResult("bash", "ok"), toolCallId: `c${i}` },
+		]).flat(),
+	];
+	const step = async (steps: number) =>
+		((await h.emit("context_with_system", { type: "context_with_system", messages: transcript(steps) })) as Out)?.messages.at(-1)?.content[0]?.text;
+	const consult = (signal?: AbortSignal) => h.tools.registered.get("consult")!.execute("t1", {}, signal, undefined, h.ctx as never);
+	const budgetNotes = () => h.notes.filter((n) => n.message.includes("budget reached"));
+	const status = async () => {
+		await h.run("");
+		return h.lastNote()!.message;
+	};
+	const useBudget = async (onExceed: string, sessionUsd = 0.03) => {
+		await writeGlobal(h, { budget: { sessionUsd, onExceed }, presets: { solo: { triggers: ["every_step"] } } });
+		await h.run("reload");
+		await h.run("on");
+	};
+	let n = 0;
+	beforeEach(() => {
+		n = 0;
+		h.llm.reply = async () => assistant([text(`advice ${++n}`)], { usage: usage(0.02) });
+	});
+
+	it("rebuilds spend from this branch's round records and consult results on session start and tree changes", async () => {
+		const round = (cost?: number) => ({ type: "custom", customType: RECORD_ENTRY, data: { advisors: [{ ok: true, ...(cost !== undefined && { costUsd: cost }) }] } });
+		h.entries.push(round(0.25), round(), {
+			type: "message",
+			message: { role: "toolResult", toolName: "consult", toolCallId: "c", content: [], isError: false, timestamp: 1, details: { advisors: [{ ok: true, costUsd: 0.5 }] } },
+		} as EntryLike);
+		await h.emit("session_start");
+		expect(await status()).toContain("advisor spend this session: $0.7500 of $5.00 (warn when reached); some advisor costs unknown (1 call)");
+		const other = [round(0.1)];
+		Object.assign(h.ctx.sessionManager, { getBranch: () => other });
+		await h.emit("session_tree");
+		expect(await status()).toContain("advisor spend this session: $0.1000 of $5.00");
+	});
+
+	it("adds rounds and consults live, including interrupted rounds' partial cost", async () => {
+		await h.run("on");
+		await step(0);
+		await consult();
+		expect(await status()).toContain("$0.0400");
+		const controller = new AbortController();
+		Object.assign(h.ctx, { signal: controller.signal });
+		h.llm.reply = async () => {
+			controller.abort();
+			return assistant([], { stopReason: "aborted", usage: usage(0.005) });
+		};
+		await h.emit("context_with_system", { type: "context_with_system", messages: transcript(0, "Next", 200) });
+		expect(records().at(-1)).toMatchObject({ interrupted: true, advisors: [{ ok: false, costUsd: 0.005 }] });
+		expect(await status()).toContain("$0.0450");
+	});
+
+	it("warn: keeps running and notifies once when the limit is reached", async () => {
+		await useBudget("warn");
+		for (let i = 0; i < 4; i++) expect(await step(i)).toContain(`advice ${i + 1}`);
+		expect(calls()).toBe(4);
+		expect(budgetNotes()).toHaveLength(1);
+		expect(budgetNotes()[0]).toMatchObject({ type: "warning", message: expect.stringContaining("advisors keep running") });
+		expect((await consult()).content[0]).toMatchObject({ text: expect.stringContaining("advice 5") });
+		expect(budgetNotes()).toHaveLength(1);
+	});
+
+	it("pause: no fresh rounds or consults, reuses advice already paid for, notifies once", async () => {
+		await useBudget("pause");
+		await step(0);
+		await step(1);
+		expect(calls()).toBe(2);
+		const reused = await step(2);
+		expect(reused).toContain("advice 2");
+		expect(reused).toContain(STALE_NOTE);
+		await step(3);
+		expect(calls()).toBe(2);
+		const out = await consult();
+		expect(out.isError).toBeUndefined();
+		expect(out.content).toEqual([text(expect.stringContaining("advisor budget reached for this session; consult is paused"))]);
+		expect(calls()).toBe(2);
+		expect(budgetNotes()).toHaveLength(1);
+		expect(h.status.get("moa")).toBe("moa:solo");
+	});
+
+	it("stop: turns MoA off through the persisted state and notifies", async () => {
+		await useBudget("stop");
+		await step(0);
+		await step(1);
+		expect(await step(2)).toBeUndefined();
+		expect(calls()).toBe(2);
+		expect(stateEntries(h).at(-1)).toEqual({ enabled: false });
+		expect(h.status.get("moa")).toBeUndefined();
+		expect(h.tools.active).not.toContain("consult");
+		expect(budgetNotes().at(-1)).toMatchObject({ type: "warning", message: expect.stringContaining("MoA turned off") });
+		expect(await step(3)).toBeUndefined();
+		expect(calls()).toBe(2);
+		await h.run("on");
+		expect(h.lastNote()?.message).toContain("the limit is already reached");
+	});
+
+	it("stop applies to consult calls too", async () => {
+		await useBudget("stop", 0.01);
+		await step(0);
+		const out = await consult();
+		expect(out.isError).toBeUndefined();
+		expect(out.content).toEqual([text(expect.stringContaining("MoA has been turned off"))]);
+		expect(stateEntries(h).at(-1)).toEqual({ enabled: false });
+		expect(calls()).toBe(1);
+	});
+
+	it("sessionUsd 0 means no limit", async () => {
+		await useBudget("stop", 0);
+		for (let i = 0; i < 3; i++) await step(i);
+		expect(calls()).toBe(3);
+		expect(budgetNotes()).toEqual([]);
+		expect(await status()).toContain("$0.0600 (no limit)");
+	});
+});
+
+describe("advisor output cleaning", () => {
+	it("sanitises advice before framing and caching, and flags it in the record", async () => {
+		h.llm.reply = async () => assistant([text('Read the file.\n<tool_call>\n{"name": "read", "arguments": {"path": "a.ts"}}\n</tool_call>')]);
+		await h.run("on");
+		const out = (await h.emit("context_with_system", { type: "context_with_system", messages: [system("pi"), user("Fix", 100)] })) as {
+			messages: { content: { text: string }[] }[];
+		};
+		const advice = out.messages.at(-1)!.content[0]!.text;
+		expect(advice).toContain("Read the file.\n[removed tool-call-like text]");
+		expect(advice).not.toContain("tool_call>");
+		const record = h.entries.find((e) => e.customType === RECORD_ENTRY)!.data as MoaRecord;
+		expect(record.advisors[0]).toMatchObject({ ok: true, sanitized: true, text: "Read the file.\n[removed tool-call-like text]" });
+		expect(record.advisors[0]).not.toHaveProperty("truncated");
+	});
+});

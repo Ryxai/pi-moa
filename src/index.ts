@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { branchSpend, budgetAction, BudgetTracker, formatUsd, spendText, type BudgetAction, type Spend } from "./budget.ts";
 import { adviceText, cacheForTurn, decideRound, storeRound, type TurnCache } from "./advice-cache.ts";
 import { moveCacheMarker } from "./cache.ts";
 import { completeMoaArgs, parseMoaArgs } from "./commands.ts";
@@ -9,7 +10,7 @@ import { resolvePreset } from "./config-resolve.ts";
 import { formatIssues, getPreset, issuesFor, type PresetConfig } from "./config.ts";
 import { createDebugLog, debugLogPath } from "./debug.ts";
 import { projectInstructions, type PromptOptionsLike } from "./roles.ts";
-import { appendAdvice, runRound, type RoundDeps, type RoundInput } from "./round.ts";
+import { appendAdvice, RECORD_ENTRY, runRound, type RoundDeps, type RoundInput } from "./round.ts";
 import { OFF, reconstructState, STATE_ENTRY, type MoaState } from "./state.ts";
 import type { ThinkingBudgets } from "@earendil-works/pi-ai";
 import type { ThinkingLevel } from "./schema.ts";
@@ -46,6 +47,7 @@ export default function moa(pi: ExtensionAPI): void {
 	/** The latest actor request's messages before our advice: what a `consult` call's advisors see. */
 	let lastRequest: readonly AgentMessage[] | undefined;
 	let consults = new ConsultCounter();
+	const budget = new BudgetTracker();
 
 	async function reload(ctx: ExtensionContext): Promise<LoadedConfig> {
 		loaded = await loadConfig({
@@ -131,6 +133,12 @@ export default function moa(pi: ExtensionAPI): void {
 		promptOptions = undefined;
 		lastRequest = undefined;
 		consults = new ConsultCounter();
+		try {
+			budget.reset(branchSpend(ctx.sessionManager.getBranch(), RECORD_ENTRY));
+		} catch (error) {
+			budget.reset({ usd: 0, unknown: 0 });
+			debug(`budget rebuild failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
 		const config = await reload(ctx);
 		for (const note of config.notes) notify(ctx, `MoA: ${note}`, "warning");
 		persisted = reconstructState(ctx.sessionManager.getBranch());
@@ -144,6 +152,27 @@ export default function moa(pi: ExtensionAPI): void {
 		}
 		updateStatus(ctx);
 		syncTools(true);
+	}
+
+	/**
+	 * Applies `budget.onExceed` once the session's advisor spend reaches `budget.sessionUsd`:
+	 * `warn` runs anyway, `pause` skips advisors, `stop` turns MoA off (persisted). Notifies once per
+	 * session (every time for `stop`).
+	 */
+	function checkBudget(ctx: ExtensionContext): BudgetAction {
+		const limits = loaded?.config.budget;
+		if (!limits) return "run";
+		const action = budgetAction(limits, budget.spend.usd);
+		if (action === "run") return action;
+		const spent = `${formatUsd(budget.spend.usd)} of ${formatUsd(limits.sessionUsd)}`;
+		if (action === "stop") {
+			setState(OFF, ctx);
+			notify(ctx, `MoA turned off: advisor budget reached (${spent}). Raise budget.sessionUsd to continue.`, "warning");
+		} else if (budget.firstNotice()) {
+			const effect = action === "warn" ? "advisors keep running" : "advisors are paused for this session; raise budget.sessionUsd and /moa reload to resume";
+			notify(ctx, `MoA: advisor budget reached (${spent}); ${effect}.`, "warning");
+		}
+		return action;
 	}
 
 	pi.on("session_start", (_event, ctx) => restore(ctx));
@@ -230,7 +259,10 @@ export default function moa(pi: ExtensionAPI): void {
 			debug(
 				`turn step=${analysis.step} errors=${analysis.consecutiveErrors} repeats=${analysis.repeatedCalls} run=${decision.reason ?? "no"}`,
 			);
-			if (decision.reason) {
+			const action = decision.reason ? checkBudget(ctx) : "run";
+			if (action === "stop") return undefined;
+			// Paused: no fresh round, but advice already paid for this turn is still reused.
+			if (decision.reason && action !== "pause") {
 				setWorking(ctx, "MoA: advisors…");
 				const round = await runRound(
 					roundInput(ctx, config, state.preset, event.messages, ctx.signal, {
@@ -245,6 +277,8 @@ export default function moa(pi: ExtensionAPI): void {
 						return undefined;
 					})
 					.finally(() => setWorking(ctx));
+				// Interrupted rounds are recorded with their partial usage and count too.
+				if (round) budget.add(round.record);
 				// Without a round (preset unusable, failure) the turn's cached advice still applies.
 				if (round?.interrupted) return undefined;
 				if (round) storeRound(cache, analysis.step, round.results, decision);
@@ -292,10 +326,21 @@ export default function moa(pi: ExtensionAPI): void {
 					snapshot: lastRequest,
 					caller: callingResponse(ctx, toolCallId),
 					counter: consults,
-					run: async ({ messages, question, turn, step }) =>
-						config && presetName
-							? runRound(roundInput(ctx, config, presetName, messages, signal ?? ctx.signal, { reason: "consult", question, turn, step }), roundDeps(ctx, config, false))
-							: undefined,
+					gate: () => {
+						const action = checkBudget(ctx);
+						if (action === "pause") return "advisor budget reached for this session; consult is paused. Continue without it.";
+						if (action === "stop") return "advisor budget reached for this session; MoA has been turned off. Continue without consult.";
+						return undefined;
+					},
+					run: async ({ messages, question, turn, step }) => {
+						if (!config || !presetName) return undefined;
+						const round = await runRound(
+							roundInput(ctx, config, presetName, messages, signal ?? ctx.signal, { reason: "consult", question, turn, step }),
+							roundDeps(ctx, config, false),
+						);
+						if (round) budget.add(round.record);
+						return round;
+					},
 				},
 				onUpdate,
 			);
@@ -310,7 +355,7 @@ export default function moa(pi: ExtensionAPI): void {
 			const config = loaded ?? (await reload(ctx));
 			switch (command.kind) {
 				case "status":
-					notify(ctx, statusText(config, state));
+					notify(ctx, statusText(config, state, budget.spend));
 					return;
 				case "on": {
 					const presetName = command.preset ?? config.config.defaultPreset;
@@ -320,7 +365,8 @@ export default function moa(pi: ExtensionAPI): void {
 						return;
 					}
 					setState({ enabled: true, preset: presetName }, ctx);
-					notify(ctx, `MoA on (preset ${presetName})`);
+					const over = budgetAction(config.config.budget, budget.spend.usd) !== "run";
+					notify(ctx, `MoA on (preset ${presetName})${over ? `; note: ${spendText(budget.spend, config.config.budget)} — the limit is already reached` : ""}`);
 					return;
 				}
 				case "off":
@@ -329,6 +375,7 @@ export default function moa(pi: ExtensionAPI): void {
 					return;
 				case "reload": {
 					const fresh = await reload(ctx);
+					budget.reset(budget.spend);
 					const problems = fresh.issues.length > 0 ? `\n${formatIssues(fresh.issues)}` : "";
 					notify(ctx, `MoA config reloaded (${fresh.issues.length} issue(s))${problems}`, problems ? "warning" : "info");
 					const active = state.enabled ? state.preset : undefined;
@@ -381,7 +428,7 @@ function sessionIdOf(ctx: ExtensionContext): string | undefined {
 	}
 }
 
-function statusText(config: LoadedConfig, state: MoaState): string {
+function statusText(config: LoadedConfig, state: MoaState, spend: Spend): string {
 	const lines: string[] = [];
 	const preset = state.enabled && state.preset ? getPreset(config.config, state.preset) : undefined;
 	if (state.enabled && !preset) {
@@ -393,6 +440,7 @@ function statusText(config: LoadedConfig, state: MoaState): string {
 	} else {
 		lines.push(`MoA off · default preset ${config.config.defaultPreset}`);
 	}
+	lines.push(spendText(spend, config.config.budget));
 	lines.push(`config: ${config.sources.length > 0 ? config.sources.join(", ") : "built-in defaults"}`);
 	if (config.issues.length > 0) lines.push(`config issues:\n${formatIssues(config.issues)}`);
 	return lines.join("\n");

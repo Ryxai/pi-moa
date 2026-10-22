@@ -58,6 +58,16 @@ The actor answers, calls tools and is saved as usual.
 
 Separately, a `before_provider_request` hook moves the cache marker off the advice block (see Caching).
 
+*Built (step 7), deviations:* `sessionUsd: 0` means no limit. `pause` skips fresh rounds but still
+reuses advice already produced this turn (already paid for); `consult` returns a non-error
+"budget reached" result under `pause` and `stop`. Spend counts the `moa` records and `consult`
+results' `details` on the branch, interrupted rounds included. Cleaning never touches code fences;
+outside them it replaces (with `[removed tool-call-like text]`, not deletion) transcript-marker
+lines, line-leading tool-call tags/tokens, framing-header impersonation and top-level JSON objects
+that are exactly a tool call (containers and tool definitions are kept), and caps each advisor's
+text at 12,000 characters; records flag `sanitized`/`truncated`. Timed-out/aborted calls wait up to 1 s for
+pi's aborted reply so its partial usage is recorded.
+
 ## The `consult` tool (on demand)
 
 - Registered with `pi.registerTool`; active only while MoA is on and `consult.enabled` is true.
@@ -222,19 +232,30 @@ built-in `solo` preset is used; `/moa init` writes it out.
 ```
 moa/
   package.json        pi package manifest (extensions entry)
-  index.ts            setup: config, commands, hooks, tool, renderer, optional virtual models
-  config.ts           load, merge over defaults, validate; resolve "current"
-  roles.ts            base rules, built-in roles, prompt assembly
-  state.ts            session on/off and preset; turn position from the transcript
-  triggers.ts         trigger evaluation, advice cache, stale detection
-  view.ts             native and text views, trimming, pinning
-  advisors.ts         parallel calls, timeouts, abort, usage and cost
-  sanitize.ts         strip tool-call-looking output
-  framing.ts          the actor-facing advice block
-  cache.ts            before_provider_request marker fix
-  consult.ts          the consult tool
-  render.ts           entry renderer and status line
-  test/               vitest unit tests (view, triggers, sanitize, framing, config, cache)
+  src/
+    index.ts          setup: config, commands, hooks, tool
+    config.ts         merge over defaults, preset lookup (schema.ts: types and defaults)
+    config-io.ts      config files: load, trust, /moa init
+    config-validate.ts  validation
+    config-resolve.ts resolve "current" and model refs
+    commands.ts       /moa argument parsing and completion
+    roles.ts          base rules, built-in roles, prompt assembly
+    state.ts          session on/off and preset
+    triggers.ts       turn analysis and trigger evaluation
+    advice-cache.ts   per-turn advice cache and stale detection
+    view.ts           native and text views, pinning
+    trim.ts           text-view trimming to the advisor's window
+    text.ts           head/tail truncation
+    round.ts          one advisor round and its record
+    advisors.ts       parallel calls, timeouts, abort, usage and cost
+    sanitize.ts       neutralise tool-call-looking output
+    budget.ts         session advisor spend and onExceed
+    framing.ts        the actor-facing advice block
+    cache.ts          before_provider_request marker fix
+    consult.ts        the consult tool (tool-names.ts: its name)
+    debug.ts          PI_MOA_DEBUG log
+    render.ts         entry renderer and status line (planned)
+  test/               vitest unit tests
 ```
 
 ## Build order (each step ends working and tested)

@@ -46,6 +46,10 @@ export interface AdvisorResult {
 	latencyMs: number;
 	/** The first reply had no text and the call was repeated with tool_choice none. */
 	retried?: true;
+	/** Tool-call-like or framing-like text was replaced (see sanitize.ts). */
+	sanitized?: true;
+	/** The text was cut to the advisor text cap. */
+	truncated?: true;
 }
 
 export interface RunOptions<M> {
@@ -53,7 +57,14 @@ export interface RunOptions<M> {
 	signal?: AbortSignal;
 	timeoutMs: number;
 	now?: () => number;
+	/**
+	 * After a timeout or abort, how long to wait for the aborted call to settle, so the partial
+	 * usage pi reports on an aborted message is still recorded. Default 1000.
+	 */
+	abortGraceMs?: number;
 }
+
+const ABORT_GRACE_MS = 1000;
 
 /** Runs every advisor in parallel. Never throws; results keep the input order. */
 export async function runAdvisors<M extends ModelLike>(
@@ -86,32 +97,60 @@ async function runAdvisor<M extends ModelLike>(advisor: AdvisorRequest<M>, optio
 	});
 	stopped.catch(() => {});
 
-	const call = (forceNone: boolean) =>
-		Promise.race([options.complete(advisor.model, advisor.context, callOptions(advisor, controller.signal, forceNone)), stopped]);
+	/**
+	 * The call's message; on timeout or abort the call's own signal is aborted (pi then ends the
+	 * provider request) and its aborted message, which carries the usage so far, is awaited
+	 * briefly. Undefined when it does not settle in time.
+	 */
+	const call = async (forceNone: boolean): Promise<AssistantMessage | undefined> => {
+		const pending = options.complete(advisor.model, advisor.context, callOptions(advisor, controller.signal, forceNone));
+		pending.catch(() => {});
+		try {
+			return await Promise.race([pending, stopped]);
+		} catch (error) {
+			if (!controller.signal.aborted) throw error;
+			return await settleWithin(pending, options.abortGraceMs ?? ABORT_GRACE_MS);
+		}
+	};
 	let retried = false;
+	let usage: Usage | undefined;
 	try {
 		const tools = declaresTools(advisor);
 		let message = await call(false);
-		let usage: Usage | undefined = message.usage;
+		usage = message?.usage;
 		// Same timeout and abort as the first call.
 		// Only tool-call replies: a length-capped or thinking-only empty reply would likely be empty again.
-		if (!reason && tools && advisor.toolChoice === "omit" && message.stopReason === "toolUse" && !textOf(message) && canForceNone(advisor)) {
+		if (message && !reason && tools && advisor.toolChoice === "omit" && message.stopReason === "toolUse" && !textOf(message) && canForceNone(advisor)) {
 			retried = true;
 			message = await call(true);
-			usage = addUsage(usage, message.usage);
+			usage = addUsage(usage, message?.usage);
 		}
 		const latency = now() - start;
-		const extra = { usage, costUsd: usage?.cost?.total, ...(retried && { retried: true as const }) };
-		if (reason) return { ...failure(advisor, reason, latency), ...extra };
+		const extra = { ...(usage && { usage, costUsd: usage.cost?.total }), ...(retried && { retried: true as const }) };
+		if (reason || !message) return { ...failure(advisor, reason ?? "aborted", latency), ...extra };
 		if (!isUsable(message)) return { ...failure(advisor, message.errorMessage ?? message.stopReason, latency), ...extra };
 		const text = textOf(message);
 		if (!text) return { ...failure(advisor, "empty response", latency), ...extra };
 		return { ...base(advisor), ok: true, text, ...extra, latencyMs: latency };
 	} catch (error) {
-		return { ...failure(advisor, reason ?? errorText(error), now() - start), ...(retried && { retried: true as const }) };
+		const extra = { ...(usage && { usage, costUsd: usage.cost?.total }), ...(retried && { retried: true as const }) };
+		return { ...failure(advisor, reason ?? errorText(error), now() - start), ...extra };
 	} finally {
 		clearTimeout(timer);
 		outer?.removeEventListener("abort", onOuterAbort);
+	}
+}
+
+/** `pending`'s message if it resolves within `ms`; rejections count as no message. */
+async function settleWithin<T>(pending: Promise<T>, ms: number): Promise<T | undefined> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const late = new Promise<undefined>((resolve) => {
+		timer = setTimeout(() => resolve(undefined), ms);
+	});
+	try {
+		return await Promise.race([pending.catch(() => undefined), late]);
+	} finally {
+		clearTimeout(timer);
 	}
 }
 

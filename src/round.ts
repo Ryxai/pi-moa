@@ -5,6 +5,7 @@ import { getPreset, type MoaConfig } from "./config.ts";
 import { arrangeAdvisors } from "./framing.ts";
 import { assemblePrompt, BASE_RULES, DEFAULT_ROLE, NATIVE_BASE_RULES, withProjectInstructions, type PromptFileReader } from "./roles.ts";
 import { moveCacheMarker } from "./cache.ts";
+import { sanitizeAdvice } from "./sanitize.ts";
 import type { AdvisorConfig, PresetConfig, ThinkingLevel } from "./schema.ts";
 import { budgetChars } from "./trim.ts";
 import type { TriggerReason } from "./triggers.ts";
@@ -157,6 +158,20 @@ export interface RoundDeps<M> {
 	debug?: (line: string) => void;
 	rng?: () => number;
 	now?: () => number;
+	/** See `RunOptions.abortGraceMs`. */
+	abortGraceMs?: number;
+}
+
+/** Sanitises and caps a successful advisor's text, flagging what changed. */
+function cleanResult(result: AdvisorResult): AdvisorResult {
+	if (!result.ok || result.text === undefined) return result;
+	const clean = sanitizeAdvice(result.text);
+	return {
+		...result,
+		text: clean.text,
+		...(clean.changed && { sanitized: true as const }),
+		...(clean.truncated && { truncated: true as const }),
+	};
 }
 
 /** The request's messages with `text` appended as a trailing user message; `messages` is not modified. */
@@ -200,7 +215,8 @@ export async function runRound<M extends ModelLike>(input: RoundInput<M>, deps: 
 			toolChoice: call.toolChoice,
 		};
 	});
-	const results = await runAdvisors(requests, { complete: deps.complete, signal: input.signal, timeoutMs: preset.timeoutMs, now });
+	const raw = await runAdvisors(requests, { complete: deps.complete, signal: input.signal, timeoutMs: preset.timeoutMs, now, abortGraceMs: deps.abortGraceMs });
+	const results = raw.map(cleanResult);
 
 	const interrupted = input.signal?.aborted === true;
 	const record: MoaRecord = {

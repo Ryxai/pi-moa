@@ -67,6 +67,8 @@ export interface ConsultEnv {
 	/** The actor's response that made the call, appended to what advisors see when found. */
 	caller?: AgentMessage;
 	counter: ConsultCounter;
+	/** A non-error reply that replaces the call (advisor budget reached), or undefined to run. */
+	gate?: () => string | undefined;
 	run(request: { messages: readonly AgentMessage[]; question?: string; turn: string; step: number }): Promise<RoundOutput | undefined>;
 }
 
@@ -87,6 +89,8 @@ export async function executeConsult(
 ): Promise<ConsultResult> {
 	if (!env.settings || !consultWanted({ consult: env.settings })) return result("consult is unavailable: MoA is off.", undefined, { isError: true });
 	if (!env.snapshot) return result("consult is unavailable: no request context.", undefined, { isError: true });
+	const blocked = env.gate?.();
+	if (blocked) return result(blocked);
 	const analysis = analyzeTurn(env.snapshot);
 	const max = env.settings.maxPerTurn;
 	if (!env.counter.take(analysis.turnKey, max)) return result(`consult limit reached for this turn (${max}).`);

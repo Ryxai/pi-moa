@@ -80,6 +80,49 @@ the next run start after a restore turned it off. Each change alters the actor's
 records as a transition in the transcript; providers that cannot express it get a full checkpoint,
 which can miss the prompt cache once.
 
+**Cleaning advisor output:** before advice is framed, cached or returned by `consult`, each
+advisor's text is cleaned so the actor is less likely to imitate tool-call or transcript syntax.
+Text inside code fences (```` ``` ```` or `~~~`, any language, also unclosed) is never changed, so
+code samples survive verbatim. Outside fences, these become `[removed tool-call-like text]`
+(adjacent ones merged):
+- lines starting with the text view's `⟨tool `/`⟨result ` markers or Hermes-style
+  `[called tool:`/`[tool result:`;
+- line-leading tool-call tags and their blocks (`<function_calls>`, `<invoke name=…>`,
+  `<parameter name=…>`, `<tool_call>`, `<tool_use>`, …) and lines starting with tool-call tokens
+  (`<|tool_call|>`, `<|python_tag|>`, `<|call|>`, `[TOOL_CALLS]`, …);
+- a top-level JSON object that is exactly a tool call: `"type": "tool_use"`/`"function_call"`, or
+  only a `name`/`tool` string plus object-valued `arguments`/`input`/`args`/`parameters` (and ids).
+  `parameters` holding a JSON Schema (a tool definition) does not count.
+
+A line starting with `[MoA reference context` becomes `[removed framing-like text]`. The trade-off
+favours keeping text: JSON containers that merely include a call (API responses, `tool_calls`
+messages, JSON-RPC `tools/call` requests, arrays of calls), tool definitions, objects whose input
+is not an object (`{"name": "build", "input": "x"}`), mid-line tag or token mentions, and anything
+fenced are kept, so an advisor can still show call syntax in those forms. Each advisor's text is
+then capped at 12,000 characters (head and tail). The record marks advisors whose text was changed
+(`sanitized`) or cut (`truncated`).
+
+**Budget** (`budget`, default `{ "sessionUsd": 5, "onExceed": "warn" }`): advisor spend is the sum
+of the advisors' reported cost (`usage.cost.total`) over the `moa` round records and `consult`
+results on the current session branch, rebuilt on session start and tree navigation and added to
+after every round and consult. Interrupted rounds and timed-out or aborted advisors count with the
+partial usage pi reports for them. Calls with no reported cost count as $0 and `/moa` says some
+costs are unknown. Before a round or consult, once spend ≥ `sessionUsd`:
+- `warn`: advisors run anyway; one notice per session.
+- `pause`: no new rounds; advice already produced this turn is still reused (it is paid for);
+  `consult` returns a non-error "advisor budget reached … consult is paused" result; one notice.
+  Raise `sessionUsd` and `/moa reload` to resume.
+- `stop`: MoA is turned off (saved in the session like `/moa off`), with a notice; `consult`
+  returns a non-error result saying so. `/moa on` works again but notes the limit is reached, and
+  the next round turns it off again until the limit is raised.
+
+`sessionUsd: 0` means no limit. `/moa` shows the spend, e.g.
+`advisor spend this session: $0.0123 of $5.00 (warn when reached)`.
+
+**Timeouts and aborts:** a timed-out or aborted advisor call has its own abort signal fired, which
+ends the provider request in pi; its aborted reply (which carries the usage reported so far) is
+awaited for up to a second so that usage is recorded.
+
 The advice renderer, `moa/<preset>` virtual models and one-shot `/moa <prompt>` are planned.
 
 **Prompt caching:** the advice changes every request, so MoA moves the conversation cache marker
@@ -101,7 +144,7 @@ pi install ./path/to/pi-moa      # or: pi -e ./path/to/pi-moa for one run
 
 | Command | Effect |
 |---|---|
-| `/moa` | Status: on/off, preset, triggers, advisors, config files |
+| `/moa` | Status: on/off, preset, triggers, advisors, advisor spend, config files |
 | `/moa on [preset]` | Turn MoA on for this session (default preset if omitted). Validates the preset and its models first. |
 | `/moa off` | Turn it off |
 | `/moa reload` | Re-read config files; turns MoA off with a warning if the active preset is no longer usable |
