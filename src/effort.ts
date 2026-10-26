@@ -82,15 +82,18 @@ export interface SlotEffort {
  * The settings a slot runs with at `level`. Explicit `thinking` and `maxTokens` on the slot win.
  * With `keepActorThinking` (native view: the call shares the actor's prompt cache, which a
  * different thinking level would invalidate on some providers), thinking comes from the level
- * only when the slot sets its own `effort`; otherwise it is left undefined for the caller to fill
- * with the actor's level.
+ * only when the slot sets its own `effort` or the level was requested outright (`requested`,
+ * the actor's `consult` effort); otherwise it is left undefined for the caller to fill with the
+ * actor's level, so a per-round bump changes only the output cap and length line.
  */
 export function slotEffort(
 	level: EffortLevel,
 	slot: Pick<AdvisorConfig, "effort" | "thinking" | "maxTokens">,
 	keepActorThinking = false,
+	requested = false,
 ): SlotEffort {
 	const profile = EFFORT_PROFILES[level];
-	const thinking = slot.thinking ?? (keepActorThinking && slot.effort === undefined ? undefined : profile.thinking);
+	const own = slot.effort !== undefined || requested;
+	const thinking = slot.thinking ?? (keepActorThinking && !own ? undefined : profile.thinking);
 	return { level, thinking, maxTokens: slot.maxTokens ?? profile.maxTokens, lengthLine: profile.lengthLine };
 }

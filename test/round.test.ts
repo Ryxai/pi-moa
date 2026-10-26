@@ -34,8 +34,8 @@ const council: MoaConfig = {
 
 const messages = [system("You are pi."), user("Fix the test", 10), assistant([text("On it.")]), toolResult("bash", "1 failing", true)];
 
-/** The text view's base rules at the default (medium) effort. */
-const MEDIUM_RULES = withLengthLine(BASE_RULES, EFFORT_PROFILES.medium.lengthLine);
+/** The text view's request at the default (medium) effort: the length line rides on the request. */
+const MEDIUM_REQUEST = `${ADVICE_REQUEST} ${EFFORT_PROFILES.medium.lengthLine}`;
 
 function setup(complete: CompleteFn<ModelLike>, overrides: Partial<RoundInput<ModelLike>> = {}) {
 	const records: MoaRecord[] = [];
@@ -81,7 +81,8 @@ describe("runRound", () => {
 			["B", "critic", "sonnet says hi"],
 		]);
 
-		expect(contexts.get("gpt")?.systemPrompt).toBe(`${MEDIUM_RULES}\n\nPlan from file.`);
+		expect(contexts.get("gpt")?.systemPrompt).toBe(`${BASE_RULES}\n\nPlan from file.`);
+		expect((contexts.get("gpt")?.messages.at(-1)!.content as { text: string }[]).at(-1)!.text.endsWith(MEDIUM_REQUEST)).toBe(true);
 		expect(contexts.get("gpt")?.messages.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
 		// "current" is the actor: native view, instructions in the trailing user message.
 		const native = contexts.get("sonnet")!;
@@ -150,13 +151,13 @@ describe("runRound", () => {
 		const payload = {
 			model: "claude",
 			messages: [
-				{ role: "user", content: [{ type: "text", text: "transcript" }, { type: "text", text: `\n\n${ADVICE_REQUEST}`, cache_control: { type: "ephemeral" } }] },
+				{ role: "user", content: [{ type: "text", text: "transcript" }, { type: "text", text: `\n\n${MEDIUM_REQUEST}`, cache_control: { type: "ephemeral" } }] },
 			],
 		};
 		expect(await hook!(payload, {} as never)).toEqual({
 			model: "claude",
 			messages: [
-				{ role: "user", content: [{ type: "text", text: "transcript", cache_control: { type: "ephemeral" } }, { type: "text", text: `\n\n${ADVICE_REQUEST}` }] },
+				{ role: "user", content: [{ type: "text", text: "transcript", cache_control: { type: "ephemeral" } }, { type: "text", text: `\n\n${MEDIUM_REQUEST}` }] },
 			],
 		});
 	});
@@ -195,8 +196,9 @@ describe("runRound", () => {
 		const request = adviceRequest("Is the fixture wrong?");
 		expect(request).toBe(`${ADVICE_REQUEST}\n\nThe acting agent asks: Is the fixture wrong?`);
 		const lastText = (c: Context) => (c.messages.at(-1)!.content as { text: string }[]).at(-1)!.text;
+		expect(lastText(contexts.get("gpt")!).endsWith(`\n\n${request} ${EFFORT_PROFILES.high.lengthLine}`)).toBe(true);
 		expect(lastText(contexts.get("sonnet")!).endsWith(`\n\n${request}`)).toBe(true);
-		expect(lastText(contexts.get("gpt")!)).toBe(`\n\n${request}`);
+		expect(lastText(contexts.get("gpt")!)).toBe(`\n\n${request} ${EFFORT_PROFILES.high.lengthLine}`);
 		expect(records).toEqual([]);
 		expect(out?.record).toMatchObject({ preset: "council", reason: "consult", question: "Is the fixture wrong?", turn: "10:abc", step: 1 });
 		expect(out?.record.advisors).toBe(out?.results);
@@ -228,7 +230,7 @@ describe("advisorView", () => {
 
 	it("appends project instructions to the text view's system prompt only when enabled", () => {
 		const on = advisorView(messages, slot(gpt), { input: input({ projectInstructions: "## AGENTS.md\n\nUse tabs." }), preset: preset({}) });
-		expect(on.context.systemPrompt).toBe(`${MEDIUM_RULES}\n\n${ROLE_PROMPTS.advisor}\n\n# Project instructions\n\n## AGENTS.md\n\nUse tabs.`);
+		expect(on.context.systemPrompt).toBe(`${BASE_RULES}\n\n${ROLE_PROMPTS.advisor}\n\n# Project instructions\n\n## AGENTS.md\n\nUse tabs.`);
 		const off = advisorView(messages, slot(gpt), {
 			input: input({ projectInstructions: "## AGENTS.md\n\nUse tabs." }),
 			preset: preset({ projectInstructions: false }),
@@ -270,9 +272,10 @@ describe("advisorView", () => {
 		const native = advisorView(messages, slot(sonnet), { input: input(), preset: preset({}) });
 		const instruction = (native.context.messages.at(-1)!.content as { text: string }[])[0]!.text;
 		expect(native.tailTexts).toEqual([instruction]);
-		expect(advisorView(messages, slot(gpt), { input: input(), preset: preset({}) }).tailTexts).toContain(ADVICE_REQUEST);
+		expect(advisorView(messages, slot(gpt), { input: input(), preset: preset({}) }).tailTexts).toContain(MEDIUM_REQUEST);
 		const asked = advisorView(messages, slot(gpt), { input: input({ question: "Why?" }), preset: preset({}) });
-		expect(asked.tailTexts).toEqual([adviceRequest("Why?"), `\n\n${adviceRequest("Why?")}`]);
+		const askedRequest = `${adviceRequest("Why?")} ${EFFORT_PROFILES.medium.lengthLine}`;
+		expect(asked.tailTexts).toEqual([askedRequest, `\n\n${askedRequest}`]);
 	});
 });
 
@@ -339,8 +342,9 @@ describe("effort in rounds", () => {
 			return { options: optionsOf(options), efforts: round?.results.map((r) => r.effort) };
 		};
 		expect(await levels("on_failure")).toEqual({ options: [["high", 256], [undefined, 4096]], efforts: ["high", "high"] });
-		expect(await levels("consult", "low")).toEqual({ options: [["low", 256], [undefined, 1024]], efforts: ["low", "low"] });
-		expect(await levels("consult", "max", "medium")).toEqual({ options: [["medium", 256], [undefined, 2048]], efforts: ["medium", "medium"] });
+		// A requested level is the actor's own ask, so native slots think at it too (a bump only changes the cap).
+		expect(await levels("consult", "low")).toEqual({ options: [["low", 256], ["low", 1024]], efforts: ["low", "low"] });
+		expect(await levels("consult", "max", "medium")).toEqual({ options: [["medium", 256], ["medium", 2048]], efforts: ["medium", "medium"] });
 	});
 
 	it("a native slot with its own effort thinks at that level", async () => {
@@ -354,14 +358,17 @@ describe("effort in rounds", () => {
 		expect(optionsOf(options)).toEqual([["high", 4096]]);
 	});
 
-	it("puts the level's length line in the prompt", async () => {
-		const prompts: (string | undefined)[] = [];
-		const { input, deps } = setup(async (_m, c) => {
-			prompts.push(c.systemPrompt ?? (c.messages.at(-1)!.content as { text: string }[])[0]!.text);
+	it("puts the level's length line in the native instruction and the text view's request, never a text system prompt", async () => {
+		const contexts = new Map<string, Context>();
+		const { input, deps } = setup(async (m, c) => {
+			contexts.set(m.id, c);
 			return assistant([text("ok")]);
 		}, { reason: "on_failure" });
 		await runRound(input, deps);
-		for (const prompt of prompts) expect(prompt).toContain(EFFORT_PROFILES.high.lengthLine);
+		const tail = (c: Context) => (c.messages.at(-1)!.content as { text: string }[]).at(-1)!.text;
+		expect(tail(contexts.get("sonnet")!)).toContain(withLengthLine(NATIVE_BASE_RULES, EFFORT_PROFILES.high.lengthLine));
+		expect(contexts.get("gpt")!.systemPrompt).not.toContain("words");
+		expect(tail(contexts.get("gpt")!).endsWith(`${ADVICE_REQUEST} ${EFFORT_PROFILES.high.lengthLine}`)).toBe(true);
 	});
 });
 
@@ -410,7 +417,7 @@ describe("synthesis", () => {
 		expect(round?.synthesis).toMatchObject({ ok: true, silent: true });
 		expect(round?.synthesis?.text).toBeUndefined();
 		expect(records[0]?.synthesis?.silent).toBe(true);
-		for (const variant of ["no reconciliation needed", "**No reconciliation needed.**", " No reconciliation needed! "]) expect(isNoReconciliation(variant)).toBe(true);
+		for (const variant of ["no reconciliation needed", "**No reconciliation needed.**", " No reconciliation needed! ", "Verdict: on-track\nNo reconciliation needed."]) expect(isNoReconciliation(variant)).toBe(true);
 		expect(isNoReconciliation("No reconciliation needed, except that A is wrong.")).toBe(false);
 		expect(NO_RECONCILIATION).toBe("No reconciliation needed.");
 	});

@@ -5,6 +5,7 @@ import type { Context } from "@earendil-works/pi-ai";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { EntryRenderer, ExtensionAPI, ExtensionCommandContext, ExtensionVirtualModel, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import moa from "../src/index.ts";
+import { EFFORT_PROFILES } from "../src/effort.ts";
 import { STALE_NOTE } from "../src/framing.ts";
 import { RECORD_ENTRY, type MoaRecord } from "../src/round.ts";
 import { STATE_ENTRY, type EntryLike } from "../src/state.ts";
@@ -39,7 +40,7 @@ interface Harness {
 	/** `sendUserMessage` calls. */
 	sent: { content: unknown; options: unknown }[];
 	/** The selected model (`ctx.model`) and whether the agent is idle. */
-	sel: { model: TestModel | undefined; idle: boolean };
+	sel: { model: TestModel | undefined; idle: boolean; pending: boolean };
 	/** Selects `next` as pi does: updates `ctx.model`, then emits `model_select`. */
 	select(next: TestModel, source?: string): Promise<unknown>;
 }
@@ -62,7 +63,7 @@ async function setup(globalConfig?: unknown): Promise<Harness> {
 	const virtual = new Map<string, ExtensionVirtualModel<unknown>>();
 	const registrations: string[] = [];
 	const sent: { content: unknown; options: unknown }[] = [];
-	const sel: { model: TestModel | undefined; idle: boolean } = { model, idle: true };
+	const sel: { model: TestModel | undefined; idle: boolean; pending: boolean } = { model, idle: true, pending: false };
 	const entries: EntryLike[] = [];
 	const notes: Note[] = [];
 	const status = new Map<string, string | undefined>();
@@ -115,6 +116,7 @@ async function setup(globalConfig?: unknown): Promise<Harness> {
 		},
 		mode: "tui",
 		isIdle: () => sel.idle,
+		hasPendingMessages: () => sel.pending,
 		isProjectTrusted: () => false,
 		modelRegistry: {
 			find: (provider: string, id: string) =>
@@ -801,7 +803,8 @@ describe("consult tool", () => {
 		await call({ question: "Why?" });
 		const context = h.llm.contexts.at(-1)!;
 		expect(context.systemPrompt).toBeDefined();
-		expect(lastText(context)).toBe(`\n\n${ADVICE_REQUEST}\n\nThe acting agent asks: Why?`);
+		// consult runs one level above the preset's medium, so the text request carries the high length line.
+		expect(lastText(context)).toBe(`\n\n${ADVICE_REQUEST}\n\nThe acting agent asks: Why? ${EFFORT_PROFILES.high.lengthLine}`);
 	});
 
 	it("leaves the turn's advice cache alone", async () => {
@@ -1405,13 +1408,13 @@ describe("before_done review", () => {
 	const transcript = (final: AgentMessage, prompt = "Fix the test", ts = 100) => [system("You are pi."), user(prompt, ts), assistant([call], { stopReason: "toolUse" }), toolResult("bash", "ok"), final];
 	const done = (t = "Done.") => assistant([text(t)]);
 	const turnEnd = (messages: AgentMessage[], extra: Record<string, unknown> = {}) =>
-		h.emit("turn_end", { type: "turn_end", outcome: "completed", message: messages.at(-1), toolResults: [], context: { contextMessages: messages, canContinue: false }, ...extra });
+		h.emit("turn_end", { type: "turn_end", outcome: "completed", message: messages.at(-1), toolResults: [], entries: [], context: { contextMessages: messages, canContinue: false }, ...extra });
 	const usePreset = async (preset: Record<string, unknown>) => {
 		await writeGlobal(h, { presets: { solo: preset } });
 		await h.run("reload");
 		await h.run("on");
 	};
-	type Boundary = { entries: { type: string; customType: string; content: string; display: boolean; details: unknown }[]; continue: boolean } | undefined;
+	type Boundary = { entries: { type: string; customType?: string; content?: string; display?: boolean; details?: unknown }[]; continue: boolean } | undefined;
 	beforeEach(() => {
 		h.llm.reply = async () => assistant([text("Verdict: revise\nThe tests were not run after the edit.")], { usage: usage(0.02) });
 	});
@@ -1427,7 +1430,8 @@ describe("before_done review", () => {
 		expect(entry.content).toContain("[MoA before-done review]");
 		expect(entry.content).toContain("Advisor A (advisor):\nVerdict: revise\nThe tests were not run after the edit.");
 		expect(records().map((r) => [r.reason, r.step, r.advisors[0]?.verdict, r.advisors[0]?.effort])).toEqual([["before_done", 2, "revise", "high"]]);
-		expect(entry.details).toEqual(records()[0]);
+		// The round is the `moa` entry; the message carries no second copy.
+		expect(entry.details).toBeUndefined();
 		// The advisors were asked to review a finished turn, at one effort level above the preset's.
 		const request = (h.llm.contexts.at(-1)!.messages.at(-1)!.content as { text: string }[])[0]!.text;
 		expect(request).toContain("The agent's last reply ends its turn");
@@ -1457,6 +1461,17 @@ describe("before_done review", () => {
 		expect(records()).toHaveLength(1);
 	});
 
+	it("keeps drafts earlier handlers proposed, and skips the review when the user has queued a message", async () => {
+		await usePreset({ triggers: ["before_done"] });
+		const earlier = { type: "custom", customType: "other-ext", data: 1 };
+		const out = (await turnEnd(transcript(done()), { entries: [earlier] })) as Boundary;
+		expect(out?.entries.map((e) => e.customType)).toEqual(["other-ext", "moa-review"]);
+		h.sel.pending = true;
+		expect(await turnEnd(transcript(done(), "Fix", 101))).toBeUndefined();
+		h.sel.pending = false;
+		expect(records()).toHaveLength(1);
+	});
+
 	it("does nothing without the trigger", async () => {
 		await h.run("on");
 		expect(await turnEnd(transcript(done()))).toBeUndefined();
@@ -1472,6 +1487,20 @@ describe("before_done review", () => {
 		const out = (await turnEnd(messages)) as Boundary;
 		const review = { role: "custom", customType: "moa-review", content: out!.entries[0]!.content, display: true, timestamp: 200 };
 		expect(await step([...messages, review])).toBeUndefined();
+	});
+
+	it("counts as the continuation step's round, so every_step does not run again on top of the review", async () => {
+		await usePreset({ triggers: ["every_step", "before_done"] });
+		const messages = transcript(done());
+		const step = (m: unknown[]) => h.emit("context_with_system", { type: "context_with_system", messages: m });
+		const out = (await turnEnd(messages)) as Boundary;
+		expect(out?.continue).toBe(true);
+		const review = { role: "custom", customType: "moa-review", content: out!.entries[0]!.content, display: true, timestamp: 200 };
+		expect(await step([...messages, review])).toBeUndefined();
+		expect(records().map((r) => r.reason)).toEqual(["before_done"]);
+		// The next real step runs as usual.
+		expect(await step([...messages, review, assistant([call], { stopReason: "toolUse" }), toolResult("bash", "ok")])).toBeDefined();
+		expect(records().map((r) => r.reason)).toEqual(["before_done", "every_step"]);
 	});
 
 	it("is paused by the advisor budget", async () => {

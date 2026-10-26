@@ -142,11 +142,11 @@ export function advisorView<M extends ModelLike>(
 	const { input, preset } = context;
 	const { config } = advisor;
 	const view = selectView(preset.context.view, advisor.model, input.actor);
-	const effort = slotEffort(roundEffort(preset, config, input.reason ?? "user_turn", input.effort), config, view === "native");
-	const prompt = (base: string) => assemblePrompt(config.role, config, input.config.roles, context.readPromptFile, base, effort.lengthLine);
+	const effort = slotEffort(roundEffort(preset, config, input.reason ?? "user_turn", input.effort), config, view === "native", input.effort !== undefined);
+	const prompt = (base: string, lengthLine?: string) => assemblePrompt(config.role, config, input.config.roles, context.readPromptFile, base, lengthLine);
 	const request = adviceRequest(input.question, input.request);
 	if (view === "native") {
-		const instruction = nativeInstruction(prompt(NATIVE_BASE_RULES), request);
+		const instruction = nativeInstruction(prompt(NATIVE_BASE_RULES, effort.lengthLine), request);
 		return {
 			view,
 			context: buildNativeView(messages, instruction, input.projection),
@@ -160,17 +160,20 @@ export function advisorView<M extends ModelLike>(
 		};
 	}
 	const instructions = preset.context.projectInstructions ? input.projectInstructions : undefined;
+	// The length line rides on the request (a tail block), not the system prompt, so the slot's
+	// cached prefix survives a change of effort level between rounds of one turn.
+	const textRequest = `${request} ${effort.lengthLine}`;
 	const textView = buildTextView(messages, {
 		systemPrompt: withProjectInstructions(prompt(BASE_RULES), instructions),
 		toolResultChars: preset.context.toolResultChars,
 		budgetChars: budgetChars(advisor.model.contextWindow, effort.maxTokens, effort.thinking),
 		pin: preset.context.pin,
-		request,
+		request: textRequest,
 	});
 	return {
 		view,
 		context: textView,
-		tailTexts: adviceRequestBlocks(request),
+		tailTexts: adviceRequestBlocks(textRequest),
 		effort: effort.level,
 		thinking: effort.thinking,
 		maxTokens: effort.maxTokens,
@@ -219,7 +222,9 @@ export function synthesisView<M extends ModelLike>(
 
 /** Whether a synthesis reply says there was nothing to reconcile. */
 export function isNoReconciliation(text: string): boolean {
-	const line = text.trim().replace(/[*_`]/g, "").replace(/[.!]+$/, "").trim().toLowerCase();
+	// A verdict line before the phrase (the rules ask for one in the other branch) does not make it advice.
+	const body = text.trim().replace(/^[*_#>\-\s]*verdict\s*:[^\n]*\n+/i, "");
+	const line = body.trim().replace(/[*_`]/g, "").replace(/[.!]+$/, "").trim().toLowerCase();
 	return line === NO_RECONCILIATION.replace(/\.$/, "").toLowerCase();
 }
 
@@ -313,7 +318,7 @@ export async function runRound<M extends ModelLike>(input: RoundInput<M>, deps: 
 	const answered = results.filter((r) => r.ok && r.text);
 	if (resolved.preset.synthesis && answered.length >= 2 && input.signal?.aborted !== true) {
 		const request = synthesisView(input.messages, resolved.preset.synthesis, answered, { input, preset, slot: slots.length });
-		const [rawSynthesis] = await runAdvisors([request], { ...runOptions, onAdvisorDone: (done, total) => deps.onAdvisorDone?.(done, total) });
+		const [rawSynthesis] = await runAdvisors([request], { ...runOptions, onAdvisorDone: (done, total) => deps.onAdvisorDone?.(slots.length + done, slots.length + total) });
 		synthesis = cleanSynthesis(rawSynthesis!);
 	}
 

@@ -547,6 +547,12 @@ export default async function moa(pi: ExtensionAPI): Promise<void> {
 		const preset = presetFor(active);
 		if (!active || !preset || !preset.triggers.includes("before_done")) return undefined;
 		if (analysis.turnKey === "" || reviewedTurn === analysis.turnKey) return undefined;
+		// The user has moved on (a queued steering or follow-up message): reviewing this turn is wasted.
+		try {
+			if (ctx.hasPendingMessages()) return undefined;
+		} catch {
+			// No queue access: review anyway.
+		}
 		reviewedTurn = analysis.turnKey;
 		const config = loaded;
 		try {
@@ -568,10 +574,17 @@ export default async function moa(pi: ExtensionAPI): Promise<void> {
 			if (round.interrupted || !shouldContinue(round.results, round.synthesis)) return undefined;
 			const advice = frameAdvice(round.results, undefined, round.synthesis);
 			if (!advice) return undefined;
-			// The review carries the turn's advice now; cached advice must not be injected on top.
-			if (turnCache?.turnKey === analysis.turnKey) dropAdvice(turnCache);
+			// The review carries the turn's advice now: cached advice must not be injected on top, and
+			// the continuation request is the step this round covered, so cadence triggers skip it.
+			const cache = cachePreset === active.preset ? cacheForTurn(turnCache, analysis) : { turnKey: analysis.turnKey };
+			dropAdvice(cache);
+			cache.lastRunStep = analysis.step;
+			turnCache = cache;
+			cachePreset = active.preset;
 			debug(`before_done review at step ${analysis.step}: continuing`);
-			return { entries: [{ type: "custom_message", customType: REVIEW_MESSAGE, content: `${REVIEW_PREAMBLE}\n\n${advice}`, display: true, details: round.record }], continue: true };
+			// Drafts earlier handlers proposed are kept: a returned list replaces the accumulated one.
+			const draft = { type: "custom_message" as const, customType: REVIEW_MESSAGE, content: `${REVIEW_PREAMBLE}\n\n${advice}`, display: true };
+			return { entries: [...(event.entries ?? []), draft], continue: true };
 		} catch (error) {
 			debug(`review failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`);
 			return undefined;

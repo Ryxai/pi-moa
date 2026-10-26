@@ -79,11 +79,17 @@ A slot's explicit `thinking` or `maxTokens` overrides the level's value. `on_fai
 `before_done` and `consult` rounds run one level above the base (the problem is harder by then);
 `user_turn`, `every_step` and `every_n` rounds run at the base. The actor's `consult` call can
 pass `effort` to request a level outright. Nothing ever exceeds the preset's `maxEffort` (default
-`"max"`). Native-view advisors share the actor's prompt cache, which a different thinking level
-would invalidate on some providers, so for them the level only sets the output cap and length
-line and thinking stays the actor's, unless the slot sets its own `effort` or `thinking`. The
-level each advisor ran at is recorded and shown on its card line. Length guidance is about 80% of
-what the cap allows, so a reply rarely hits it; one that does is marked (see Cleaning).
+`"max"`); a base `effort` above it is clamped silently. Native-view advisors share the actor's
+prompt cache, which a different thinking level would invalidate on some providers, so for them a
+per-round bump only sets the output cap and length line and thinking stays the actor's; the
+level sets their thinking too when the slot has its own `effort` or `thinking`, or when the actor
+requested the level through `consult`. The thinking level sent is always clamped to what the
+advisor's model supports (as pi clamps the actor's). The level each advisor ran at is recorded
+and shown on its card line. In text views the length line rides on the closing advice request (a
+request-local block), not the system prompt, so a slot's cached prefix survives a change of level
+between rounds of one turn; in native views it is part of the trailing instruction. Length
+guidance is about 80% of what the cap allows, so a reply rarely hits it; one that does is marked
+(see Cleaning).
 
 **Verdicts:** every advisor is asked to open with one line, `Verdict: on-track` (carry on),
 `Verdict: revise` (change something first; it says what) or `Verdict: blocked` (only the user can
@@ -96,8 +102,8 @@ with two or more advisors, their advice is unreconciled, so the framing says so 
 to decide from the transcript where they disagree. A synthesis slot adds one call after the round
 (text view of the transcript plus the advisors' advice, with `maxTokens` 1024 by default and no
 thinking unless set) whose only job is to reconcile real disagreements. It replies exactly
-`No reconciliation needed.` when the advisors agree or differ only in emphasis, and that reply is
-dropped: the actor sees nothing from it. Otherwise it opens with its own verdict and, in about 150
+`No reconciliation needed.` when the advisors agree or differ only in emphasis (a verdict line
+before it is tolerated), and that reply is dropped: the actor sees nothing from it. Otherwise it opens with its own verdict and, in about 150
 words, names each disagreement, says which side the transcript supports, and gives one
 recommendation; that is appended as a `Synthesis:` block after the advisors, with a note replacing
 the unreconciled one. It never runs with one advisor or when fewer than two answered, its cost
@@ -112,11 +118,14 @@ spoke with a verdict) the framed advice is appended as a `moa-review` message, w
 saying the turn would have ended and the actor should continue on the points that hold up or say
 why it disagrees, and pi runs one more model request; this is the one case besides `consult` where
 advice stays in the conversation. On `on-track` or `blocked` the turn ends. At most one review per
-turn, never after an aborted or failed reply, under a `pause`d or `stop`ped budget, or for a
-reply that calls tools. Text views later show the delivered review as
-`[MoA before-done review: advice omitted]`, as they do consult results; native views keep it. The
-turn's cached advice is dropped once a review is delivered, so the continuation carries the review
-alone. In the transcript the message shows as one line; the advice is on the round's card.
+turn, never after an aborted or failed reply, under a `pause`d or `stop`ped budget, for a reply
+that calls tools, or when the user has already queued a steering or follow-up message. Text views
+later show the delivered review as `[MoA before-done review: advice omitted]`, as they do consult
+results; native views keep it. The turn's cached advice is dropped once a review is delivered and
+the continuation counts as the step the review covered, so it carries the review alone even under
+`every_step`; the step after that runs rounds as usual. Entries other extensions proposed at the
+same turn end are kept. In the transcript the message shows as one line; the advice is on the
+round's card.
 
 **The `consult` tool:** while MoA is on and the preset has `consult.enabled` (and `maxPerTurn` > 0),
 the actor gets a `consult` tool with an optional `question` and an optional `effort` (see Effort). It runs the preset's advisors (same
