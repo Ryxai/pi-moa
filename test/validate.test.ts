@@ -97,3 +97,25 @@ describe("validateConfig", () => {
 		expectIssue({ ui: { status: "yes" } }, "ui.status", "true or false");
 	});
 });
+
+describe("effort, synthesis and before_done", () => {
+	it("checks effort levels on presets and advisors", () => {
+		expect(messages({ presets: { solo: { effort: "high", maxEffort: "max", advisors: [{ model: "current", effort: "low" }] } } })).toEqual([]);
+		expectIssue({ presets: { solo: { effort: "ultra" } } }, "presets.solo.effort", "must be one of");
+		expectIssue({ presets: { solo: { maxEffort: 3 } } }, "presets.solo.maxEffort", "must be one of");
+		expectIssue({ presets: { solo: { advisors: [{ model: "current", effort: "xhigh" }] } } }, "presets.solo.advisors[0].effort", "must be one of");
+	});
+
+	it("checks the synthesis slot", () => {
+		expect(messages({ presets: { solo: { synthesis: { model: "openai/gpt", thinking: "low", maxTokens: 500, prompt: "Be brief." } } } })).toEqual([]);
+		expectIssue({ presets: { solo: { synthesis: "openai/gpt" } } }, "presets.solo.synthesis", "must be an object");
+		expectIssue({ presets: { solo: { synthesis: { model: "moa/solo" } } } }, "presets.solo.synthesis.model", "moa/*");
+		expectIssue({ presets: { solo: { synthesis: { model: "openai/gpt", role: "x" } } } }, "presets.solo.synthesis.role", "unknown key");
+		expectIssue({ presets: { solo: { synthesis: { model: "openai/gpt", maxTokens: 0 } } } }, "presets.solo.synthesis.maxTokens", "integer");
+		expectIssue({ presets: { solo: { synthesis: { model: "openai/gpt", prompt: " " } } } }, "presets.solo.synthesis.prompt", "non-empty");
+	});
+
+	it("accepts before_done as a trigger", () => {
+		expect(messages({ presets: { solo: { triggers: ["user_turn", "before_done"] } } })).toEqual([]);
+	});
+});

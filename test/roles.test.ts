@@ -3,10 +3,13 @@ import {
 	assemblePrompt,
 	BASE_RULES,
 	NATIVE_BASE_RULES,
+	NO_RECONCILIATION,
 	PROJECT_INSTRUCTIONS_CHARS,
 	projectInstructions,
 	ROLE_PROMPTS,
 	STANCE_LINES,
+	SYNTHESIS_RULES,
+	withLengthLine,
 	withProjectInstructions,
 } from "../src/roles.ts";
 
@@ -54,7 +57,30 @@ describe("assemblePrompt", () => {
 		expect(BASE_RULES).toMatch(/Never write a tool call/);
 		expect(BASE_RULES).toMatch(/Never claim or imply/);
 		expect(BASE_RULES).toMatch(/verify X/);
-		expect(BASE_RULES).toMatch(/400 words/);
+		// Length guidance comes from the effort level, not the base rules.
+		expect(BASE_RULES).not.toMatch(/words/);
+		expect(NATIVE_BASE_RULES).not.toMatch(/words/);
+	});
+
+	it("base rules ask for a verdict line first", () => {
+		for (const base of [BASE_RULES, NATIVE_BASE_RULES]) {
+			expect(base).toMatch(/Start with exactly one line "Verdict: on-track", "Verdict: revise" or "Verdict: blocked"/);
+		}
+	});
+
+	it("appends the effort level's length line as the last base rule", () => {
+		const prompt = assemblePrompt("critic", {}, {}, undefined, BASE_RULES, "Keep under about 120 words.");
+		expect(prompt).toBe(`${BASE_RULES}\n- Keep under about 120 words.\n\n${ROLE_PROMPTS.critic}`);
+		expect(withLengthLine(BASE_RULES, undefined)).toBe(BASE_RULES);
+		// replaceBase drops the length line with the rest of the base rules.
+		expect(assemblePrompt("raw", {}, { raw: { prompt: "Mine.", replaceBase: true } }, undefined, BASE_RULES, "Keep it short.")).toBe("Mine.");
+	});
+});
+
+describe("SYNTHESIS_RULES", () => {
+	it("tells the synthesis slot to stay silent when there is nothing to reconcile", () => {
+		expect(SYNTHESIS_RULES).toContain(`reply with exactly: ${NO_RECONCILIATION}`);
+		expect(SYNTHESIS_RULES).toMatch(/Never add advice of your own/);
 	});
 });
 

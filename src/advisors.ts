@@ -1,14 +1,17 @@
 import {
+	clampThinkingLevel,
 	getCurrentTools,
 	normalizeContext,
+	type Api,
 	type AssistantMessage,
 	type Context,
+	type Model,
 	type SimpleStreamOptions,
 	type ThinkingBudgets,
 	type Usage,
 } from "@earendil-works/pi-ai";
 import type { ModelLike } from "./config-resolve.ts";
-import type { ThinkingLevel } from "./schema.ts";
+import type { EffortLevel, ThinkingLevel, Verdict } from "./schema.ts";
 
 /** One model call; in production `ctx.modelRegistry.streamSimple(...).result()`. */
 export type CompleteFn<M> = (model: M, context: Context, options: SimpleStreamOptions) => Promise<AssistantMessage>;
@@ -18,6 +21,8 @@ export interface AdvisorRequest<M extends ModelLike> {
 	model: M;
 	role: string;
 	context: Context;
+	/** The effort level the call runs at (recorded on the result). */
+	effort?: EffortLevel;
 	thinking?: ThinkingLevel;
 	/** Token budgets per thinking level (pi's `thinkingBudgets` setting), as the actor gets them. */
 	thinkingBudgets?: ThinkingBudgets;
@@ -44,12 +49,20 @@ export interface AdvisorResult {
 	usage?: Usage;
 	costUsd?: number;
 	latencyMs: number;
+	/** The effort level the call ran at. */
+	effort?: EffortLevel;
+	/** The verdict line the advisor opened with, when it gave one. */
+	verdict?: Verdict;
 	/** The first reply had no text and the call was repeated with tool_choice none. */
 	retried?: true;
 	/** Tool-call-like or framing-like text was replaced (see sanitize.ts). */
 	sanitized?: true;
 	/** The text was cut to the advisor text cap. */
 	truncated?: true;
+	/** The reply stopped at `maxTokens` (the provider's length stop); its text is incomplete. */
+	capped?: true;
+	/** Synthesis only: the slot found nothing to reconcile, so nothing is shown to the actor. */
+	silent?: true;
 }
 
 export interface RunOptions<M> {
@@ -149,7 +162,8 @@ async function runAdvisor<M extends ModelLike>(advisor: AdvisorRequest<M>, optio
 		if (!isUsable(message)) return { ...failure(advisor, message.errorMessage ?? message.stopReason, latency), ...extra };
 		const text = textOf(message);
 		if (!text) return { ...failure(advisor, "empty response", latency), ...extra };
-		return { ...base(advisor), ok: true, text, ...extra, latencyMs: latency };
+		const capped = message.stopReason === "length" ? { capped: true as const } : {};
+		return { ...base(advisor), ok: true, text, ...extra, ...capped, latencyMs: latency };
 	} catch (error) {
 		const extra = { ...(usage && { usage, costUsd: usage.cost?.total }), ...(retried && { retried: true as const }) };
 		return { ...failure(advisor, reason ?? errorText(error), now() - start), ...extra };
@@ -207,20 +221,31 @@ export function addUsage(a: Usage | undefined, b: Usage | undefined): Usage | un
 	};
 }
 
+/**
+ * The thinking level to send: `level` clamped to what the model supports (pi-ai sends an
+ * unsupported `xhigh`/`max` as is, which providers reject), as pi clamps the actor's. A model
+ * without pi's `reasoning` flag (not a pi `Model`) is left alone.
+ */
+export function thinkingFor(model: ModelLike, level: ThinkingLevel | undefined): ThinkingLevel | undefined {
+	if (!level || typeof model.reasoning !== "boolean") return level;
+	return clampThinkingLevel(model as unknown as Model<Api>, level);
+}
+
 function callOptions(advisor: AdvisorRequest<ModelLike>, signal: AbortSignal, forceNone: boolean): SimpleStreamOptions {
 	const options: SimpleStreamOptions = { signal };
 	const none = forceNone || advisor.toolChoice !== "omit";
 	if (none && declaresTools(advisor) && canForceNone(advisor)) options.toolChoice = "none";
 	if (advisor.maxTokens !== undefined) options.maxTokens = advisor.maxTokens;
-	if (advisor.thinking && advisor.thinking !== "off") options.reasoning = advisor.thinking;
+	const thinking = thinkingFor(advisor.model, advisor.thinking);
+	if (thinking && thinking !== "off") options.reasoning = thinking;
 	if (advisor.thinkingBudgets) options.thinkingBudgets = advisor.thinkingBudgets;
 	if (advisor.sessionId) options.sessionId = advisor.sessionId;
 	if (advisor.onPayload) options.onPayload = advisor.onPayload;
 	return options;
 }
 
-function base(advisor: AdvisorRequest<ModelLike>): Pick<AdvisorResult, "label" | "model" | "role"> {
-	return { label: advisor.label, model: `${advisor.model.provider}/${advisor.model.id}`, role: advisor.role };
+function base(advisor: AdvisorRequest<ModelLike>): Pick<AdvisorResult, "label" | "model" | "role" | "effort"> {
+	return { label: advisor.label, model: `${advisor.model.provider}/${advisor.model.id}`, role: advisor.role, ...(advisor.effort && { effort: advisor.effort }) };
 }
 
 function failure(advisor: AdvisorRequest<ModelLike>, error: string, latencyMs: number): AdvisorResult {

@@ -29,9 +29,18 @@ export const ADVICE_REQUEST =
  */
 const BLOCK_SEPARATOR = "\n\n";
 
-/** The advice request, with the acting agent's question for a `consult` call. */
-export function adviceRequest(question?: string): string {
-	return question ? `${ADVICE_REQUEST}\n\nThe acting agent asks: ${question}` : ADVICE_REQUEST;
+/** The advice request (`base`, default `ADVICE_REQUEST`), with the acting agent's question for a `consult` call. */
+export function adviceRequest(question?: string, base: string = ADVICE_REQUEST): string {
+	return question ? `${base}\n\nThe acting agent asks: ${question}` : base;
+}
+
+export const SYNTHESIS_REQUEST =
+	"Above is the conversation so far between the user and the agent. Below is the advice each advisor gave for the agent's next step. Reconcile it as instructed.";
+
+/** The synthesis slot's closing request: the advisors' advice, labelled as the actor will see it. */
+export function synthesisRequest(advice: readonly { label: string; role: string; text?: string }[]): string {
+	const blocks = advice.map((r) => `Advisor ${r.label} (${r.role}):\n${(r.text ?? "").trim()}`);
+	return [SYNTHESIS_REQUEST, ...blocks].join("\n\n");
 }
 
 /** The exact texts a text view's advice-request block can have (its own message, or appended to a user turn). */
@@ -42,6 +51,10 @@ export function adviceRequestBlocks(request: string): readonly string[] {
 export const ADVICE_REQUEST_BLOCKS = adviceRequestBlocks(ADVICE_REQUEST);
 
 const CONSULT_OMITTED = "advice omitted";
+
+/** Custom message type of a delivered `before_done` review (review.ts; imported by name to avoid a cycle). */
+const REVIEW_MESSAGE = "moa-review";
+const REVIEW_OMITTED = "[MoA before-done review: advice omitted]";
 
 const AGENT_FIRST = "(The transcript starts with the agent.)";
 
@@ -185,6 +198,11 @@ export function renderTranscript(messages: readonly AgentMessage[], toolResultCh
 export function renderEntries(messages: readonly AgentMessage[], toolResultChars: number): Entry[] {
 	const entries: Entry[] = [];
 	for (const source of messages) {
+		// Advisors never see earlier advice: a delivered review is the advice itself.
+		if (source.role === "custom" && source.customType === REVIEW_MESSAGE) {
+			entries.push({ role: "user", text: REVIEW_OMITTED, timestamp: source.timestamp, source: source.role });
+			continue;
+		}
 		for (const message of convertToLlm([source])) {
 			const rendered = renderMessage(message, toolResultChars);
 			if (!rendered) continue;

@@ -372,3 +372,12 @@ describe("advice cache", () => {
 		});
 	});
 });
+
+describe("before_done in shouldRun", () => {
+	it("never fires from the request hook; it runs at turn_end", () => {
+		const onFailure = { consecutiveErrors: 2, repeatedCalls: 3 };
+		const at = (step: number) => ({ step, consecutiveErrors: 0, repeatedCalls: 0 });
+		expect(shouldRun(["before_done"], onFailure, at(0))).toEqual({ run: false, reason: null });
+		expect(shouldRun(["before_done", "user_turn"], onFailure, at(0))).toEqual({ run: true, reason: "user_turn" });
+	});
+});

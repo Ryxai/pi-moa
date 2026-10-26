@@ -33,7 +33,8 @@ export interface TurnAnalysis {
 	userText?: string;
 }
 
-export type TriggerReason = "user_turn" | "every_step" | "every_n" | "on_failure";
+/** `before_done` rounds run at `turn_end` (see review.ts), not from `shouldRun`. */
+export type TriggerReason = "user_turn" | "every_step" | "every_n" | "on_failure" | "before_done";
 
 export interface Streak {
 	id: string;
@@ -139,6 +140,7 @@ export function shouldRun(
 				failure = { ...(errors && { errors }), ...(repeats && { repeats }) };
 			}
 		} else if (trigger === "every_step") fired.add("every_step");
+		else if (trigger === "before_done") continue;
 		else if (trigger === "user_turn") {
 			if (analysis.step === 0) fired.add("user_turn");
 		} else if (trigger.every_n > 0 && analysis.step % trigger.every_n === 0) fired.add("every_n");

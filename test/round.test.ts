@@ -3,9 +3,10 @@ import { describe, expect, it } from "vitest";
 import type { CompleteFn } from "../src/advisors.ts";
 import type { ModelLike, ModelLookup } from "../src/config-resolve.ts";
 import { DEFAULT_CONFIG, DEFAULT_PRESET, type MoaConfig } from "../src/config.ts";
-import { BASE_RULES, NATIVE_BASE_RULES, ROLE_PROMPTS } from "../src/roles.ts";
-import { advisorView, appendAdvice, runRound, type MoaRecord, type RoundDeps, type RoundInput } from "../src/round.ts";
-import { ADVICE_REQUEST, adviceRequest } from "../src/view.ts";
+import { EFFORT_PROFILES } from "../src/effort.ts";
+import { BASE_RULES, NATIVE_BASE_RULES, NO_RECONCILIATION, ROLE_PROMPTS, SYNTHESIS_RULES, withLengthLine } from "../src/roles.ts";
+import { advisorView, appendAdvice, CAPPED_NOTE, cleanResult, isNoReconciliation, runRound, SYNTHESIS_MAX_TOKENS, type MoaRecord, type RoundDeps, type RoundInput } from "../src/round.ts";
+import { ADVICE_REQUEST, adviceRequest, SYNTHESIS_REQUEST } from "../src/view.ts";
 import { assistant, system, text, toolResult, user, usage } from "./fixtures.ts";
 
 const sonnet: ModelLike = { provider: "anthropic", id: "sonnet" };
@@ -32,6 +33,9 @@ const council: MoaConfig = {
 };
 
 const messages = [system("You are pi."), user("Fix the test", 10), assistant([text("On it.")]), toolResult("bash", "1 failing", true)];
+
+/** The text view's base rules at the default (medium) effort. */
+const MEDIUM_RULES = withLengthLine(BASE_RULES, EFFORT_PROFILES.medium.lengthLine);
 
 function setup(complete: CompleteFn<ModelLike>, overrides: Partial<RoundInput<ModelLike>> = {}) {
 	const records: MoaRecord[] = [];
@@ -77,7 +81,7 @@ describe("runRound", () => {
 			["B", "critic", "sonnet says hi"],
 		]);
 
-		expect(contexts.get("gpt")?.systemPrompt).toBe(`${BASE_RULES}\n\nPlan from file.`);
+		expect(contexts.get("gpt")?.systemPrompt).toBe(`${MEDIUM_RULES}\n\nPlan from file.`);
 		expect(contexts.get("gpt")?.messages.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
 		// "current" is the actor: native view, instructions in the trailing user message.
 		const native = contexts.get("sonnet")!;
@@ -224,7 +228,7 @@ describe("advisorView", () => {
 
 	it("appends project instructions to the text view's system prompt only when enabled", () => {
 		const on = advisorView(messages, slot(gpt), { input: input({ projectInstructions: "## AGENTS.md\n\nUse tabs." }), preset: preset({}) });
-		expect(on.context.systemPrompt).toBe(`${BASE_RULES}\n\n${ROLE_PROMPTS.advisor}\n\n# Project instructions\n\n## AGENTS.md\n\nUse tabs.`);
+		expect(on.context.systemPrompt).toBe(`${MEDIUM_RULES}\n\n${ROLE_PROMPTS.advisor}\n\n# Project instructions\n\n## AGENTS.md\n\nUse tabs.`);
 		const off = advisorView(messages, slot(gpt), {
 			input: input({ projectInstructions: "## AGENTS.md\n\nUse tabs." }),
 			preset: preset({ projectInstructions: false }),
@@ -255,7 +259,8 @@ describe("advisorView", () => {
 		const own = advisorView(messages, slot(sonnet, { thinking: "low" }), { input: input(extra), preset: preset({ nativeToolChoice: "none" }) });
 		expect(own).toMatchObject({ thinking: "low", toolChoice: "none" });
 		const text = advisorView(messages, { ...slot(gpt), slot: 2 }, { input: input(extra), preset: preset({}) });
-		expect(text.thinking).toBeUndefined();
+		// Text views think at the effort level (medium by default), never at the actor's level.
+		expect(text.thinking).toBe("medium");
 		expect(text.sessionId).toBe("moa2-s");
 		expect(text.toolChoice).toBeUndefined();
 		expect(text.thinkingBudgets).toBeUndefined();
@@ -278,5 +283,160 @@ describe("appendAdvice", () => {
 		expect(messages).toEqual(snapshot);
 		expect(out.slice(0, -1)).toEqual(messages);
 		expect(out.at(-1)).toEqual({ role: "user", content: [{ type: "text", text: "advice" }], timestamp: 99 });
+	});
+});
+
+describe("cleanResult", () => {
+	const result = (text: string, extra: Partial<AdvisorResultLike> = {}): AdvisorResultLike => ({ label: "A", model: "m/x", role: "advisor", ok: true, text, latencyMs: 1, ...extra });
+	type AdvisorResultLike = Parameters<typeof cleanResult>[0];
+
+	it("reads the verdict line and keeps it in the text", () => {
+		const clean = cleanResult(result("Verdict: revise\nRun the tests first."));
+		expect(clean.verdict).toBe("revise");
+		expect(clean.text).toBe("Verdict: revise\nRun the tests first.");
+		expect(cleanResult(result("No verdict here."))).not.toHaveProperty("verdict");
+	});
+
+	it("appends the cut-off note to a capped reply, after sanitising", () => {
+		const clean = cleanResult(result("Verdict: on-track\nKeep going and then", { capped: true }));
+		expect(clean.text).toBe(`Verdict: on-track\nKeep going and then\n\n${CAPPED_NOTE}`);
+		expect(clean.verdict).toBe("on-track");
+		expect(clean.capped).toBe(true);
+	});
+
+	it("leaves failures alone", () => {
+		const failed = { ...result(""), ok: false, text: undefined, error: "timeout" };
+		expect(cleanResult(failed)).toBe(failed);
+	});
+});
+
+describe("effort in rounds", () => {
+	const optionsOf = (options: SimpleStreamOptions[]) => options.map((o) => [o.reasoning, o.maxTokens]);
+
+	it("text advisors get the level's thinking and cap; native advisors keep the actor's thinking", async () => {
+		const options: SimpleStreamOptions[] = [];
+		const { input, deps } = setup(async (_m, _c, o) => {
+			options.push(o);
+			return assistant([text("Verdict: on-track\nok")]);
+		}, { actorThinking: "low" });
+		await runRound(input, deps);
+		// Display order is fixed (shuffle: false): A = gpt (text), B = sonnet (native).
+		expect(optionsOf(options)).toEqual([
+			["medium", 256], // the slot's own maxTokens wins
+			["low", 2048],
+		]);
+	});
+
+	it("on_failure rounds run one level higher; a requested effort replaces that; maxEffort caps both", async () => {
+		const levels = async (reason: RoundInput<ModelLike>["reason"], effort?: RoundInput<ModelLike>["effort"], maxEffort: MoaConfig["presets"][string]["maxEffort"] = "max") => {
+			const options: SimpleStreamOptions[] = [];
+			const config = { ...council, presets: { ...council.presets, council: { ...council.presets.council!, maxEffort } } };
+			const { input, deps } = setup(async (_m, _c, o) => {
+				options.push(o);
+				return assistant([text("ok")]);
+			}, { reason, effort, config });
+			const round = await runRound(input, deps);
+			return { options: optionsOf(options), efforts: round?.results.map((r) => r.effort) };
+		};
+		expect(await levels("on_failure")).toEqual({ options: [["high", 256], [undefined, 4096]], efforts: ["high", "high"] });
+		expect(await levels("consult", "low")).toEqual({ options: [["low", 256], [undefined, 1024]], efforts: ["low", "low"] });
+		expect(await levels("consult", "max", "medium")).toEqual({ options: [["medium", 256], [undefined, 2048]], efforts: ["medium", "medium"] });
+	});
+
+	it("a native slot with its own effort thinks at that level", async () => {
+		const options: SimpleStreamOptions[] = [];
+		const config = { ...council, presets: { ...council.presets, council: { ...council.presets.council!, advisors: [{ model: "current", effort: "high" as const }] } } };
+		const { input, deps } = setup(async (_m, _c, o) => {
+			options.push(o);
+			return assistant([text("ok")]);
+		}, { actorThinking: "low", config });
+		await runRound(input, deps);
+		expect(optionsOf(options)).toEqual([["high", 4096]]);
+	});
+
+	it("puts the level's length line in the prompt", async () => {
+		const prompts: (string | undefined)[] = [];
+		const { input, deps } = setup(async (_m, c) => {
+			prompts.push(c.systemPrompt ?? (c.messages.at(-1)!.content as { text: string }[])[0]!.text);
+			return assistant([text("ok")]);
+		}, { reason: "on_failure" });
+		await runRound(input, deps);
+		for (const prompt of prompts) expect(prompt).toContain(EFFORT_PROFILES.high.lengthLine);
+	});
+});
+
+describe("synthesis", () => {
+	const withSynthesis = (extra: Partial<NonNullable<MoaConfig["presets"][string]["synthesis"]>> = {}, advisors = council.presets.council!.advisors): MoaConfig => ({
+		...council,
+		presets: { ...council.presets, council: { ...council.presets.council!, advisors, synthesis: { model: "openai/gpt", ...extra } } },
+	});
+	const replies = (synthesis: string) => async (_m: ModelLike, c: Context, _o?: SimpleStreamOptions) => {
+		const last = (c.messages.at(-1)!.content as { text: string }[]).map((b) => b.text).join("");
+		return last.includes(SYNTHESIS_REQUEST) ? assistant([text(synthesis)], { usage: usage(0.003) }) : assistant([text(`Verdict: revise\n${_m.id} says so`)], { usage: usage(0.01) });
+	};
+
+	it("runs after the advisors with their advice, and is recorded and returned when it reconciles", async () => {
+		const contexts: Context[] = [];
+		const complete = replies("Verdict: revise\nA is right.");
+		const { input, deps, records } = setup(async (m, c, o) => {
+			contexts.push(c);
+			return complete(m, c, o);
+		}, { config: withSynthesis({ maxTokens: 300, prompt: "Prefer the cheaper path." }), sessionId: "s" });
+		const round = await runRound(input, deps);
+		expect(round?.synthesis).toMatchObject({ label: "synthesis", role: "synthesis", ok: true, verdict: "revise", text: "Verdict: revise\nA is right.", costUsd: 0.003 });
+		expect(records[0]?.synthesis).toEqual(round?.synthesis);
+		const synthesisContext = contexts.at(-1)!;
+		expect(synthesisContext.systemPrompt).toBe(`${SYNTHESIS_RULES}\n\nPrefer the cheaper path.`);
+		const request = (synthesisContext.messages.at(-1)!.content as { text: string }[]).at(-1)!.text;
+		expect(request).toContain(SYNTHESIS_REQUEST);
+		expect(request).toContain("Advisor A (planner):\nVerdict: revise\ngpt says so");
+		expect(request).toContain("Advisor B (critic):\nVerdict: revise\nsonnet says so");
+		expect(deps.now).toBeDefined();
+	});
+
+	it("uses its own cap and thinking, a session id after the advisor slots, and no project instructions", async () => {
+		const options: SimpleStreamOptions[] = [];
+		const { input, deps } = setup(async (_m, c, o) => {
+			options.push(o);
+			return replies("x")(_m, c, o);
+		}, { config: withSynthesis({ thinking: "low" }), sessionId: "s", projectInstructions: "## AGENTS.md\n\nTabs." });
+		await runRound(input, deps);
+		expect(options.at(-1)).toMatchObject({ maxTokens: SYNTHESIS_MAX_TOKENS, reasoning: "low", sessionId: "moa2-s" });
+	});
+
+	it("is silent when it finds nothing to reconcile", async () => {
+		const { input, deps, records } = setup(replies("No reconciliation needed."), { config: withSynthesis() });
+		const round = await runRound(input, deps);
+		expect(round?.synthesis).toMatchObject({ ok: true, silent: true });
+		expect(round?.synthesis?.text).toBeUndefined();
+		expect(records[0]?.synthesis?.silent).toBe(true);
+		for (const variant of ["no reconciliation needed", "**No reconciliation needed.**", " No reconciliation needed! "]) expect(isNoReconciliation(variant)).toBe(true);
+		expect(isNoReconciliation("No reconciliation needed, except that A is wrong.")).toBe(false);
+		expect(NO_RECONCILIATION).toBe("No reconciliation needed.");
+	});
+
+	it("does not run with fewer than two answering advisors", async () => {
+		let calls = 0;
+		const { input, deps } = setup(async (m, c, o) => {
+			calls++;
+			return m.id === "gpt" && !JSON.stringify(c).includes(SYNTHESIS_REQUEST) ? assistant([], { stopReason: "error", errorMessage: "down" }) : replies("x")(m, c, o);
+		}, { config: withSynthesis() });
+		const round = await runRound(input, deps);
+		expect(calls).toBe(2);
+		expect(round?.synthesis).toBeUndefined();
+		const solo = setup(replies("x"), { config: withSynthesis({}, [{ model: "current" }]) });
+		await runRound(solo.input, solo.deps);
+		expect(solo.records[0]?.synthesis).toBeUndefined();
+	});
+
+	it("records a failed synthesis without losing the advisors' advice", async () => {
+		const { input, deps } = setup(async (m, c, o) => {
+			const last = (c.messages.at(-1)!.content as { text: string }[]).map((b) => b.text).join("");
+			if (last.includes(SYNTHESIS_REQUEST)) throw new Error("boom");
+			return replies("x")(m, c, o);
+		}, { config: withSynthesis() });
+		const round = await runRound(input, deps);
+		expect(round?.results.every((r) => r.ok)).toBe(true);
+		expect(round?.synthesis).toMatchObject({ ok: false, error: "boom" });
 	});
 });

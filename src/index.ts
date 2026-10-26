@@ -3,7 +3,7 @@ import { clampThinkingLevel, getSupportedThinkingLevels, type ModelThinkingLevel
 import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { branchSpend, budgetAction, BudgetTracker, formatUsd, spendText, type BudgetAction, type Spend } from "./budget.ts";
-import { adviceText, cacheForTurn, decideRound, storeRound, type TurnCache } from "./advice-cache.ts";
+import { adviceText, cacheForTurn, decideRound, dropAdvice, storeRound, type TurnCache } from "./advice-cache.ts";
 import { moveCacheMarker } from "./cache.ts";
 import { completeMoaArgs, parseMoaArgs } from "./commands.ts";
 import { CONSULT_DESCRIPTION, CONSULT_TOOL, ConsultCounter, consultParameters, consultWanted, executeConsult, syncConsultTool } from "./consult.ts";
@@ -11,7 +11,9 @@ import { CONFIG_FILE, loadConfig, writeDefaultConfig, type LoadedConfig } from "
 import { resolvePreset } from "./config-resolve.ts";
 import { formatIssues, getPreset, issuesFor, type MoaConfig, type PresetConfig } from "./config.ts";
 import { createDebugLog, debugLogPath } from "./debug.ts";
-import { progressText, renderConsultResult, renderEntry, consultCallText, statusLine, type AdviceDisplay } from "./render.ts";
+import { progressText, renderConsultResult, renderEntry, consultCallText, reviewMessageText, statusLine, type AdviceDisplay } from "./render.ts";
+import { endsTurn, REVIEW_MESSAGE, REVIEW_PREAMBLE, REVIEW_REQUEST, shouldContinue } from "./review.ts";
+import { frameAdvice } from "./framing.ts";
 import { projectInstructions, type PromptOptionsLike } from "./roles.ts";
 import { appendAdvice, RECORD_ENTRY, runRound, type RoundDeps, type RoundInput } from "./round.ts";
 import { OFF, reconstructState, STATE_ENTRY, type MoaState } from "./state.ts";
@@ -92,6 +94,10 @@ export default async function moa(pi: ExtensionAPI): Promise<void> {
 	let oneShot: OneShot | undefined;
 	/** Turn key of the latest request; a one-shot never binds to the turn current when it was sent. */
 	let lastTurnKey: string | undefined;
+	/** Turn key of the last `before_done` review, which runs at most once per turn. */
+	let reviewedTurn: string | undefined;
+	/** The preset a one-shot turn bound to, for the turn's `before_done` review (the hook's own match has passed by then). */
+	let oneShotTurn: { turn: string; preset: string } | undefined;
 
 	async function reload(ctx: ExtensionContext): Promise<LoadedConfig> {
 		loaded = await loadConfig({
@@ -298,6 +304,8 @@ export default async function moa(pi: ExtensionAPI): Promise<void> {
 		turnCache = undefined;
 		oneShot = undefined;
 		lastTurnKey = undefined;
+		reviewedTurn = undefined;
+		oneShotTurn = undefined;
 		compacting = false;
 		tracked = trackSession(tracked, ctx.model);
 		promptOptions = undefined;
@@ -417,7 +425,7 @@ export default async function moa(pi: ExtensionAPI): Promise<void> {
 		actor: Model | undefined,
 		messages: readonly AgentMessage[],
 		signal: AbortSignal | undefined,
-		round: Pick<RoundInput<Model>, "reason" | "turn" | "step" | "question">,
+		round: Pick<RoundInput<Model>, "reason" | "turn" | "step" | "question" | "effort" | "request">,
 	): RoundInput<Model> {
 		return {
 			messages,
@@ -465,6 +473,7 @@ export default async function moa(pi: ExtensionAPI): Promise<void> {
 		lastTurnKey = analysis.turnKey;
 		const once = matchOneShot(oneShot, analysis);
 		oneShot = once.pending;
+		if (once.preset) oneShotTurn = { turn: analysis.turnKey, preset: once.preset };
 		const active = activeFor(ctx.model, once.preset);
 		debug(
 			`context_with_system #${contextCalls} enabled=${state.enabled} preset=${active?.preset ?? "-"} via=${active?.source ?? "-"} messages=${event.messages.length} last=${last?.role}`,
@@ -507,7 +516,7 @@ export default async function moa(pi: ExtensionAPI): Promise<void> {
 				}
 				// Without a round (preset unusable, failure) the turn's cached advice still applies.
 				if (round?.interrupted) return undefined;
-				if (round) storeRound(cache, analysis.step, round.results, decision);
+				if (round) storeRound(cache, analysis.step, round, decision);
 			}
 			const text = adviceText(cache, analysis);
 			if (!text) return undefined;
@@ -518,6 +527,58 @@ export default async function moa(pi: ExtensionAPI): Promise<void> {
 			return undefined;
 		}
 	});
+
+	/**
+	 * `before_done`: when a reply ends the turn, advisors review the work. On a `revise` verdict the
+	 * framed advice is appended as a custom message (the one other case, besides `consult`, where
+	 * advice stays in context) and pi runs one more model request. At most once per turn.
+	 */
+	pi.on("turn_end", async (event, ctx) => {
+		if (event.outcome !== "completed" || !endsTurn(event.message) || !loaded) return undefined;
+		let analysis: ReturnType<typeof analyzeTurn>;
+		try {
+			analysis = analyzeTurn(event.context.contextMessages);
+		} catch (error) {
+			debug(`review analysis failed: ${errorText(error)}`);
+			return undefined;
+		}
+		const oncePreset = oneShotTurn?.turn === analysis.turnKey ? oneShotTurn.preset : undefined;
+		const active = activeFor(ctx.model, oncePreset);
+		const preset = presetFor(active);
+		if (!active || !preset || !preset.triggers.includes("before_done")) return undefined;
+		if (analysis.turnKey === "" || reviewedTurn === analysis.turnKey) return undefined;
+		reviewedTurn = analysis.turnKey;
+		const config = loaded;
+		try {
+			const action = checkBudget(ctx, active.source);
+			if (action === "pause" || action === "stop") return undefined;
+			const messages = event.context.contextMessages;
+			const actor = currentActor(ctx, ctx.model, messages);
+			if (actor.error) debug(`actor unresolved: ${actor.error}`);
+			const input = roundInput(ctx, config, active.preset, actor.model, messages, ctx.signal, {
+				reason: "before_done",
+				request: REVIEW_REQUEST,
+				turn: analysis.turnKey,
+				step: analysis.step,
+			});
+			const round = await withProgress(ctx, () => runRound(input, roundDeps(ctx, config, true)));
+			if (!round) return undefined;
+			budget.add(round.record);
+			updateStatus(ctx);
+			if (round.interrupted || !shouldContinue(round.results, round.synthesis)) return undefined;
+			const advice = frameAdvice(round.results, undefined, round.synthesis);
+			if (!advice) return undefined;
+			// The review carries the turn's advice now; cached advice must not be injected on top.
+			if (turnCache?.turnKey === analysis.turnKey) dropAdvice(turnCache);
+			debug(`before_done review at step ${analysis.step}: continuing`);
+			return { entries: [{ type: "custom_message", customType: REVIEW_MESSAGE, content: `${REVIEW_PREAMBLE}\n\n${advice}`, display: true, details: round.record }], continue: true };
+		} catch (error) {
+			debug(`review failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`);
+			return undefined;
+		}
+	});
+
+	pi.registerMessageRenderer(REVIEW_MESSAGE, (_message, _options, theme) => new Text(reviewMessageText(theme), 0, 0));
 
 	// Keep the actor's conversation cache marker off the advice block (see cache.ts). Fires for
 	// the agent's own requests, their retries and pi's cache-warmer replays; not for advisor calls,
@@ -562,11 +623,12 @@ export default async function moa(pi: ExtensionAPI): Promise<void> {
 						}
 						return undefined;
 					},
-					run: async ({ messages, question, turn, step }) => {
+					run: async ({ messages, question, effort, turn, step }) => {
 						if (!config || !presetName) return undefined;
 						const input = roundInput(ctx, config, presetName, currentActor(ctx, ctx.model, messages).model, messages, signal ?? ctx.signal, {
 							reason: "consult",
 							question,
+							effort,
 							turn,
 							step,
 						});
@@ -738,8 +800,9 @@ function statusText(config: LoadedConfig, active: Active | undefined, state: Moa
 		lines.push(`${head} · preset ${active.preset} (unavailable in current config)`);
 	} else if (active && preset) {
 		const triggers = preset.triggers.map((t) => (typeof t === "string" ? t : `every_n:${t.every_n}`)).join(", ");
-		const advisors = preset.advisors.map((a) => `${a.model} (${a.role ?? "advisor"})`).join(", ");
-		lines.push(`${head} · preset ${active.preset}`, `triggers: ${triggers}`, `advisors: ${advisors}`);
+		const advisors = preset.advisors.map((a) => `${a.model} (${a.role ?? "advisor"}${a.effort ? `, effort ${a.effort}` : ""})`).join(", ");
+		lines.push(`${head} · preset ${active.preset}`, `triggers: ${triggers}`, `advisors: ${advisors}`, `effort: ${preset.effort} (max ${preset.maxEffort})`);
+		if (preset.synthesis) lines.push(`synthesis: ${preset.synthesis.model}`);
 		if (actor) lines.push(`actor: ${actor}`);
 		if (active.source === "model" && state.enabled && state.preset) lines.push(`/moa on (preset ${state.preset}) resumes when another model is selected`);
 	} else {

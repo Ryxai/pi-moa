@@ -1,6 +1,6 @@
 # pi-moa — Mixture of Models for pi
 
-Status: plan agreed 2026-10-22. Build in this folder (rename `mom` → `moa` at build start).
+Status: plan agreed 2026-10-22; steps 1–9 built, step 10 (effort, verdicts, synthesis, before-done review) built 2026-10-26. Build in this folder (rename `mom` → `moa` at build start).
 pi source for reference: `~/Workspaces/Harnesses/pi` (docs: `packages/coding-agent/docs/extensions.md`, `virtual-models.md`).
 
 ## Goal
@@ -151,7 +151,9 @@ pi's aborted reply so its partial usage is recorded.
   - Never claim to have done anything.
   - Never write tool calls or JSON shaped like them.
   - Separate what you are confident about from what needs checking.
-  - Be concise; keep under about 400 words unless needed.
+  - Be concise; lead with what matters most.
+  - Open with one line `Verdict: on-track | revise | blocked`.
+  - The effort level's length line is appended last (step 10): 120 / 300 / 600 words, or a summary first at `max`.
 
 ## Framing (what the actor sees)
 
@@ -170,6 +172,8 @@ Advisor B (critic):
 - `anonymize`: advisors are labelled A/B rather than by model name.
 - `shuffle`: order is randomised.
 - If every advisor fails, there is no block; show a UI notice only.
+- *Step 10:* with two or more advisors and no synthesis text the header says they wrote independently and may
+  conflict; a synthesis that reconciled something is appended as `Synthesis:` with its own note instead.
 
 ## Caching
 
@@ -199,8 +203,10 @@ built-in `solo` preset is used; `/moa init` writes it out.
     "solo": {
       "actor": "current",
       "advisors": [
-        { "model": "current", "role": "advisor", "maxTokens": 2048 }
+        { "model": "current", "role": "advisor" }
       ],
+      "effort": "medium",
+      "maxEffort": "max",
       "triggers": ["user_turn", "on_failure"],
       "onFailure": { "consecutiveErrors": 2, "repeatedCalls": 3 },
       "consult": { "enabled": true, "maxPerTurn": 3 },
@@ -216,10 +222,11 @@ built-in `solo` preset is used; `/moa init` writes it out.
     },
     "council": {
       "advisors": [
-        { "model": "openai/gpt-5.6", "role": "planner" },
+        { "model": "openai/gpt-5.6", "role": "planner", "effort": "high" },
         { "model": "current", "role": "critic", "stance": "against" }
       ],
-      "triggers": ["user_turn", { "every_n": 3 }, "on_failure"]
+      "synthesis": { "model": "openai/gpt-5.6-mini", "maxTokens": 1024 },
+      "triggers": ["user_turn", { "every_n": 3 }, "on_failure", "before_done"]
     }
   },
   "budget": { "sessionUsd": 5, "onExceed": "warn" },
@@ -234,6 +241,8 @@ built-in `solo` preset is used; `/moa init` writes it out.
 - No `moa/*` models inside a preset.
 - Unknown roles are reported.
 - Errors are reported clearly, and the preset is refused rather than failing mid-turn.
+- *Step 10:* `effort`, `maxEffort` and advisor `effort` must be `low|medium|high|max`; `synthesis` takes
+  `model` (resolved like an advisor's), `thinking`, `maxTokens`, `prompt`; `before_done` is a trigger name.
 
 ## Commands and UI
 
@@ -260,7 +269,10 @@ moa/
     config-validate.ts  validation
     config-resolve.ts resolve "current" and model refs
     commands.ts       /moa argument parsing and completion
-    roles.ts          base rules, built-in roles, prompt assembly
+    roles.ts          base rules, built-in roles, prompt assembly, synthesis rules
+    effort.ts         effort levels: thinking, output cap, length line, bumps and caps
+    verdict.ts        the advisors' verdict line
+    review.ts         before-done review: turn-end detection, combined verdict, request text
     state.ts          session on/off and preset
     triggers.ts       turn analysis and trigger evaluation
     advice-cache.ts   per-turn advice cache and stale detection
@@ -296,12 +308,24 @@ moa/
 7. **Cleaning, budget, timeouts and abort**; interrupted rounds are never cached.
 8. **UI:** renderer, status line, live progress.
 9. **Optional `moa/<preset>` virtual models** and `/moa <prompt>` one-shot.
+10. **Effort levels, verdicts, synthesis, before-done review** (built; see README for behaviour):
+   - `effort` per preset and slot bundles thinking, `maxTokens` and the prompt's length line (the flat
+     "400 words" rule is gone); `on_failure`, `before_done` and `consult` run one level up, `consult`
+     may request a level, `maxEffort` caps everything; native slots keep the actor's thinking unless
+     they set their own `effort`/`thinking` (prompt-cache principle).
+   - A length-stopped reply gets a cut-off note and the `capped` flag.
+   - Each advisor opens with `Verdict: on-track | revise | blocked`; parsed into the record and shown
+     on the card.
+   - Optional `synthesis` slot after rounds with two or more answering advisors; replies exactly
+     `No reconciliation needed.` when there is nothing to reconcile (dropped), else reconciles in ~150
+     words with its own verdict; without it the framing notes the advice is unreconciled.
+   - `before_done` trigger: at `turn_end` of a reply without tool calls, advisors review the work; on a
+     combined `revise` the advice is appended as a `moa-review` custom message with `continue: true`
+     (advice in context, like `consult`); once per turn; text views show it as omitted advice.
 
 ## Later
 
-- Synthesis slot.
 - Skipping trivial prompts.
-- Severity tags.
 - `/moa label` (did the advice help?).
 - Side-by-side viewer.
 - Read-only tools for `consult`.

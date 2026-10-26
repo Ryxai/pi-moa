@@ -11,8 +11,9 @@ Rules:
 - Advise only. Never claim or imply that you ran, read, checked, tested or changed anything. Do not invent tool results or describe outcomes you have not been shown.
 - Write in prose. Never write a tool call, a function call, or a JSON object shaped like one, and never imitate the ⟨tool …⟩ or ⟨result …⟩ notation. The agent decides which tools to call.
 - Separate what you are confident about from what needs checking. When you are unsure of an API, path, version or fact, say "I'm not sure; verify X" instead of guessing.
-- Be concise and specific: lead with what matters most and keep under about 400 words unless the problem truly needs more.
-- Respond with your advice directly, without preamble. Your response is private guidance for the agent, not an answer shown to the user.`;
+- Be concise and specific: lead with what matters most.
+- Respond with your advice directly, without preamble. Your response is private guidance for the agent, not an answer shown to the user.
+- Start with exactly one line "Verdict: on-track", "Verdict: revise" or "Verdict: blocked": on-track means the agent's approach and work so far are sound and it should carry on; revise means it should change something before continuing (say what); blocked means it cannot make progress without the user (say why). Then give your advice.`;
 
 /**
  * Base rules for the native view, sent as a user message after the actor's own transcript: the
@@ -26,8 +27,9 @@ Rules:
 - Advise only. Never claim or imply that you ran, read, checked, tested or changed anything. Do not invent tool results or describe outcomes you have not been shown.
 - Write in prose. Do not call tools, and never write a tool call, a function call, or a JSON object shaped like one. The agent decides which tools to call.
 - Separate what you are confident about from what needs checking. When you are unsure of an API, path, version or fact, say "I'm not sure; verify X" instead of guessing.
-- Be concise and specific: lead with what matters most and keep under about 400 words unless the problem truly needs more.
-- Respond with your advice directly, without preamble. Your response is private guidance for the agent, not an answer shown to the user.`;
+- Be concise and specific: lead with what matters most.
+- Respond with your advice directly, without preamble. Your response is private guidance for the agent, not an answer shown to the user.
+- Start with exactly one line "Verdict: on-track", "Verdict: revise" or "Verdict: blocked": on-track means the agent's approach and work so far are sound and it should carry on; revise means it should change something before continuing (say what); blocked means it cannot make progress without the user (say why). Then give your advice.`;
 
 export const ROLE_PROMPTS: Record<(typeof BUILTIN_ROLES)[number], string> = {
 	advisor:
@@ -51,9 +53,10 @@ export const STANCE_LINES: Record<Stance, string> = {
 export type PromptFileReader = (path: string) => string | undefined;
 
 /**
- * Builds an advisor's system prompt: base rules (unless the role sets `replaceBase`), the role
- * prompt (config override, else built in), the slot's own `prompt`, and the stance line.
- * `base` is `BASE_RULES` for the text view, `NATIVE_BASE_RULES` for the native view.
+ * Builds an advisor's system prompt: base rules (unless the role sets `replaceBase`) with the
+ * effort level's length line appended, the role prompt (config override, else built in), the
+ * slot's own `prompt`, and the stance line. `base` is `BASE_RULES` for the text view,
+ * `NATIVE_BASE_RULES` for the native view.
  */
 export function assemblePrompt(
 	roleName: string | undefined,
@@ -61,6 +64,7 @@ export function assemblePrompt(
 	configRoles: Readonly<Record<string, RoleConfig>>,
 	readPromptFile: PromptFileReader = () => undefined,
 	base: string = BASE_RULES,
+	lengthLine?: string,
 ): string {
 	const name = roleName ?? DEFAULT_ROLE;
 	const override = Object.hasOwn(configRoles, name) ? configRoles[name] : undefined;
@@ -69,7 +73,7 @@ export function assemblePrompt(
 		(override?.promptFile ? readPromptFile(override.promptFile) : undefined) ??
 		(Object.hasOwn(ROLE_PROMPTS, name) ? ROLE_PROMPTS[name as keyof typeof ROLE_PROMPTS] : undefined);
 	const parts = [
-		override?.replaceBase ? undefined : base,
+		override?.replaceBase ? undefined : withLengthLine(base, lengthLine),
 		rolePrompt,
 		slot.prompt,
 		slot.stance ? STANCE_LINES[slot.stance] : undefined,
@@ -79,6 +83,21 @@ export function assemblePrompt(
 		.filter((part): part is string => !!part)
 		.join("\n\n");
 }
+
+/** The base rules with the effort level's length guidance as their last rule. */
+export function withLengthLine(base: string, lengthLine: string | undefined): string {
+	return lengthLine ? `${base.trimEnd()}\n- ${lengthLine}` : base;
+}
+
+/** Said by the synthesis slot when there is nothing to reconcile; such a reply is dropped. */
+export const NO_RECONCILIATION = "No reconciliation needed.";
+
+export const SYNTHESIS_RULES = `You are the synthesis step of a Mixture of Models process. Several advisor models, who could not see each other, have each advised the acting agent on its next step. You are shown the conversation so far (the agent's tool calls as ⟨tool name(args)⟩ and their results as ⟨result name: …⟩) and the advisors' advice. You cannot call tools, and nothing you write is executed.
+
+Your only job is to reconcile the advisors where they disagree. Read the advice against the transcript.
+- If the advisors agree, or differ only in emphasis or detail, or there is one clear recommendation, reply with exactly: ${NO_RECONCILIATION}
+- Otherwise start with one line "Verdict: on-track", "Verdict: revise" or "Verdict: blocked" (your resolved view of whether the agent should carry on, change something first, or cannot proceed without the user), then, in under about 150 words, name each real disagreement, say which side the transcript supports and why, and end with a single recommendation.
+- Never add advice of your own beyond resolving the conflicts, never claim to have run or checked anything, and never write tool calls or JSON shaped like them.`;
 
 export const PROJECT_INSTRUCTIONS_CHARS = 8000;
 

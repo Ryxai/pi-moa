@@ -34,18 +34,38 @@ function costText(spend: Spend): string | undefined {
 
 const SEP = " · ";
 
-/** The one-line summary of a round, e.g. `◇ MoA · user_turn · step 2 · 2/2 advisors · $0.0120 · 4.1s`. */
+type Color = Parameters<ThemeLike["fg"]>[0];
+const VERDICT_COLOR: Record<string, Color> = { "on-track": "success", revise: "warning", blocked: "error" };
+
+/** The round's verdicts as `revise ×2, on-track`, most severe first; undefined when none was given. */
+export function verdictSummary(record: MoaRecord): string | undefined {
+	const counts = new Map<string, number>();
+	const all = record.synthesis ? [...record.advisors, record.synthesis] : record.advisors;
+	for (const advisor of all) if (advisor.ok && advisor.verdict) counts.set(advisor.verdict, (counts.get(advisor.verdict) ?? 0) + 1);
+	if (counts.size === 0) return undefined;
+	const order = ["blocked", "revise", "on-track"];
+	return order
+		.filter((v) => counts.has(v))
+		.map((v) => (counts.get(v)! > 1 ? `${v} ×${counts.get(v)}` : v))
+		.join(", ");
+}
+
+/** The one-line summary of a round, e.g. `◇ MoA · user_turn · step 2 · 2/2 advisors · revise · $0.0120 · 4.1s`. */
 export function cardLine(record: MoaRecord, theme: ThemeLike): string {
 	const ok = record.advisors.filter((a) => a.ok).length;
 	const total = record.advisors.length;
 	const countColor = ok === total ? "muted" : ok === 0 ? "error" : "warning";
-	const latency = Math.max(0, ...record.advisors.map((a) => (Number.isFinite(a.latencyMs) ? a.latencyMs : 0)));
+	const calls = record.synthesis ? [...record.advisors, record.synthesis] : record.advisors;
+	const latency = Math.max(0, ...calls.map((a) => (Number.isFinite(a.latencyMs) ? a.latencyMs : 0)));
 	const parts = [
 		theme.fg("accent", "◇ MoA"),
 		theme.fg("muted", record.reason),
 		...(typeof record.step === "number" ? [theme.fg("muted", `step ${record.step}`)] : []),
 		theme.fg(countColor, `${ok}/${total} advisor${total === 1 ? "" : "s"}`),
 	];
+	const verdicts = verdictSummary(record);
+	if (verdicts) parts.push(theme.fg(VERDICT_COLOR[verdicts.split(" ")[0]!] ?? "muted", verdicts));
+	if (record.synthesis) parts.push(theme.fg(record.synthesis.ok ? "muted" : "warning", record.synthesis.ok ? (record.synthesis.silent ? "synthesis: nothing to reconcile" : "synthesis") : "synthesis failed"));
 	const cost = costText(recordSpend(record));
 	if (cost) parts.push(theme.fg("muted", cost));
 	if (latency > 0) parts.push(theme.fg("muted", formatLatency(latency)));
@@ -56,6 +76,9 @@ export function cardLine(record: MoaRecord, theme: ThemeLike): string {
 /** One advisor's header line: label, model, role, tokens, cost, latency and flags. */
 export function advisorLine(advisor: AdvisorResult, theme: ThemeLike): string {
 	const parts = [theme.bold(advisor.label), theme.fg("muted", advisor.model), theme.fg("muted", advisor.role)];
+	if (advisor.effort) parts.push(theme.fg("muted", `effort ${advisor.effort}`));
+	if (advisor.ok && advisor.verdict) parts.push(theme.fg(VERDICT_COLOR[advisor.verdict] ?? "muted", advisor.verdict));
+	if (advisor.ok && advisor.silent) parts.push(theme.fg("muted", "nothing to reconcile"));
 	const usage = advisor.usage;
 	if (usage) {
 		const input = usage.input + usage.cacheRead + usage.cacheWrite;
@@ -64,7 +87,7 @@ export function advisorLine(advisor: AdvisorResult, theme: ThemeLike): string {
 	}
 	if (typeof advisor.costUsd === "number" && Number.isFinite(advisor.costUsd)) parts.push(theme.fg("dim", formatUsd(advisor.costUsd)));
 	if (advisor.latencyMs > 0) parts.push(theme.fg("dim", formatLatency(advisor.latencyMs)));
-	const flags = (["retried", "sanitized", "truncated"] as const).filter((flag) => advisor[flag]);
+	const flags = (["retried", "sanitized", "truncated", "capped"] as const).filter((flag) => advisor[flag]);
 	if (flags.length > 0) parts.push(theme.fg("warning", flags.join(", ")));
 	const head = parts.join(theme.fg("dim", SEP));
 	return advisor.ok ? head : `${head}\n${theme.fg("error", `error: ${advisor.error ?? "failed"}`)}`;
@@ -104,11 +127,17 @@ export function recordComponent(record: MoaRecord, expanded: boolean, theme: The
 	if (!expanded) return card;
 	if (record.question) card.addChild(new Text(theme.fg("muted", `Question: ${record.question}`), 0, 0));
 	const md = markdownTheme(theme);
-	for (const advisor of record.advisors) {
+	const calls = record.synthesis ? [...record.advisors, record.synthesis] : record.advisors;
+	for (const advisor of calls) {
 		card.addChild(new Text(`\n${advisorLine(advisor, theme)}`, 0, 0));
 		if (advisor.ok && advisor.text) card.addChild(new Markdown(advisor.text, 2, 0, md));
 	}
 	return card;
+}
+
+/** The transcript line for a `before_done` review message sent back to the actor (its round shows as its own card). */
+export function reviewMessageText(theme: ThemeLike): string {
+	return [theme.fg("accent", "◇ MoA"), theme.fg("muted", "before_done review sent to the agent; it continues working (see the round above)")].join(theme.fg("dim", SEP));
 }
 
 /** Whether a record shows expanded under `display` when pi's expand toggle is `expanded`. */

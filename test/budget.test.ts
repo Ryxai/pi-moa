@@ -73,3 +73,10 @@ describe("spendText", () => {
 		);
 	});
 });
+
+describe("recordSpend with synthesis", () => {
+	it("adds the synthesis call's cost and counts it when unknown", () => {
+		expect(recordSpend({ ...record(advisor(0.01)), synthesis: advisor(0.002) })).toEqual({ usd: 0.012, unknown: 0 });
+		expect(recordSpend({ ...record(advisor(0.01)), synthesis: advisor() })).toEqual({ usd: 0.01, unknown: 1 });
+	});
+});

@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { AdvisorResult } from "../src/advisors.ts";
-import { CONSULT_TOOL, ConsultCounter, consultWanted, executeConsult, syncConsultTool, type ConsultEnv } from "../src/consult.ts";
+import { CONSULT_TOOL, ConsultCounter, consultParameters, consultWanted, executeConsult, syncConsultTool, type ConsultEnv } from "../src/consult.ts";
 import { FRAMING_HEADER, STALE_NOTE } from "../src/framing.ts";
 import type { MoaRecord, RoundOutput } from "../src/round.ts";
+import { EFFORT_LEVELS } from "../src/schema.ts";
 import { analyzeTurn } from "../src/triggers.ts";
 import { assistant, system, text, toolResult, user, usage } from "./fixtures.ts";
 
@@ -185,5 +186,36 @@ describe("executeConsult", () => {
 		expect([...off.runs, ...none.runs]).toEqual([]);
 		const unusable = env([], { run: async () => undefined });
 		expect(await executeConsult({}, unusable.env)).toMatchObject({ isError: true, content: [text("consult failed: the preset has no usable advisors.")] });
+	});
+});
+
+describe("executeConsult effort and synthesis", () => {
+	it("passes a valid effort to the round and ignores an unknown one", async () => {
+		const { env: e, runs } = env([ok("A", "Go.")]);
+		await executeConsult({ effort: "high" }, e);
+		await executeConsult({ effort: "ultra" as never }, e);
+		expect(runs.map((r) => r.effort ?? "none")).toEqual(["high", "none"]);
+	});
+
+	it("declares every effort level to the actor", () => {
+		const effort = consultParameters.properties.effort as { anyOf: { const: string }[] };
+		expect(effort.anyOf.map((o) => o.const)).toEqual([...EFFORT_LEVELS]);
+	});
+
+	it("frames the synthesis with the advice and counts its usage", async () => {
+		const results = [ok("A", "Go."), ok("B", "Stop.")];
+		const synthesis: AdvisorResult = { ...ok("synthesis", "Verdict: revise\nGo, then stop.", 0.002), role: "synthesis" };
+		const { env: e } = env(results, {
+			run: async (request) => ({
+				results,
+				synthesis,
+				interrupted: false,
+				record: { preset: "solo", reason: "consult", turn: request.turn, step: request.step, advisors: results, synthesis },
+			}),
+		});
+		const out = await executeConsult({}, e);
+		expect(textOf(out)).toContain("Synthesis:\nVerdict: revise\nGo, then stop.");
+		expect(out.usage?.cost.total).toBeCloseTo(0.022);
+		expect((out.details as MoaRecord).synthesis).toEqual(synthesis);
 	});
 });

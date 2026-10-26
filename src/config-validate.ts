@@ -3,6 +3,7 @@ import {
 	BUDGET_ACTIONS,
 	BUILTIN_ROLES,
 	CONTEXT_VIEWS,
+	EFFORT_LEVELS,
 	isPlainObject,
 	NAMED_TRIGGERS,
 	NATIVE_TOOL_CHOICES,
@@ -27,8 +28,9 @@ export const RESERVED_NAMES = new Set(["__proto__", "constructor", "prototype"])
 type Report = (path: string, message: string) => void;
 
 const TOP_KEYS = ["defaultPreset", "roles", "presets", "budget", "ui", "virtualModels"];
-const PRESET_KEYS = ["actor", "advisors", "triggers", "onFailure", "consult", "context", "framing", "timeoutMs"];
-const ADVISOR_KEYS = ["model", "role", "prompt", "stance", "thinking", "maxTokens"];
+const PRESET_KEYS = ["actor", "advisors", "synthesis", "effort", "maxEffort", "triggers", "onFailure", "consult", "context", "framing", "timeoutMs"];
+const ADVISOR_KEYS = ["model", "role", "prompt", "stance", "effort", "thinking", "maxTokens"];
+const SYNTHESIS_KEYS = ["model", "thinking", "maxTokens", "prompt"];
 const ROLE_KEYS = ["prompt", "promptFile", "replaceBase"];
 
 /** Merging drops reserved keys, so they're checked on the raw layers. */
@@ -111,6 +113,9 @@ function validatePreset(preset: unknown, path: string, roles: Set<string>, repor
 	checkKeys(preset, PRESET_KEYS, path, report);
 	checkModelRef(preset.actor, `${path}.actor`, report);
 	validateAdvisors(preset.advisors, `${path}.advisors`, roles, report);
+	if (preset.synthesis !== undefined) validateSynthesis(preset.synthesis, `${path}.synthesis`, report);
+	checkEnum(preset.effort, EFFORT_LEVELS, `${path}.effort`, report);
+	checkEnum(preset.maxEffort, EFFORT_LEVELS, `${path}.maxEffort`, report);
 	validateTriggers(preset.triggers, `${path}.triggers`, report);
 	const { onFailure, consult, context, framing } = preset;
 	if (asObject(onFailure, `${path}.onFailure`, report)) {
@@ -151,8 +156,21 @@ function validateAdvisor(advisor: unknown, path: string, roles: Set<string>, rep
 	}
 	if (advisor.prompt !== undefined) checkString(advisor.prompt, `${path}.prompt`, report);
 	if (advisor.stance !== undefined) checkEnum(advisor.stance, STANCES, `${path}.stance`, report);
+	if (advisor.effort !== undefined) checkEnum(advisor.effort, EFFORT_LEVELS, `${path}.effort`, report);
 	if (advisor.thinking !== undefined) checkEnum(advisor.thinking, THINKING_LEVELS, `${path}.thinking`, report);
 	if (advisor.maxTokens !== undefined) checkInt(advisor.maxTokens, `${path}.maxTokens`, 1, 1_000_000, report);
+}
+
+function validateSynthesis(synthesis: unknown, path: string, report: Report): void {
+	if (!isPlainObject(synthesis)) {
+		report(path, "must be an object");
+		return;
+	}
+	checkKeys(synthesis, SYNTHESIS_KEYS, path, report);
+	checkModelRef(synthesis.model, `${path}.model`, report);
+	if (synthesis.thinking !== undefined) checkEnum(synthesis.thinking, THINKING_LEVELS, `${path}.thinking`, report);
+	if (synthesis.maxTokens !== undefined) checkInt(synthesis.maxTokens, `${path}.maxTokens`, 1, 1_000_000, report);
+	if (synthesis.prompt !== undefined) checkString(synthesis.prompt, `${path}.prompt`, report);
 }
 
 function validateTriggers(triggers: unknown, path: string, report: Report): void {

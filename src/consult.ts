@@ -3,7 +3,7 @@ import { Type, type Static } from "typebox";
 import { addUsage } from "./advisors.ts";
 import { frameAdvice } from "./framing.ts";
 import type { MoaRecord, RoundOutput } from "./round.ts";
-import type { PresetConfig } from "./schema.ts";
+import { EFFORT_LEVELS, type EffortLevel, type PresetConfig } from "./schema.ts";
 import { analyzeTurn } from "./triggers.ts";
 import type { AgentMessage } from "./view.ts";
 
@@ -19,6 +19,11 @@ export const CONSULT_DESCRIPTION =
 
 export const consultParameters = Type.Object({
 	question: Type.Optional(Type.String({ description: "What you want advice on. Omit for a general review of your next step." })),
+	effort: Type.Optional(
+		Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high"), Type.Literal("max")], {
+			description: "How hard the advisors should think: low for a quick check, high or max for a hard problem. Omit for the preset's default.",
+		}),
+	),
 });
 
 export type ConsultParams = Static<typeof consultParameters>;
@@ -69,7 +74,7 @@ export interface ConsultEnv {
 	counter: ConsultCounter;
 	/** A non-error reply that replaces the call (advisor budget reached), or undefined to run. */
 	gate?: () => string | undefined;
-	run(request: { messages: readonly AgentMessage[]; question?: string; turn: string; step: number }): Promise<RoundOutput | undefined>;
+	run(request: { messages: readonly AgentMessage[]; question?: string; effort?: EffortLevel; turn: string; step: number }): Promise<RoundOutput | undefined>;
 }
 
 const result = (text: string, details?: MoaRecord, extra: Partial<ConsultResult> = {}): ConsultResult => ({
@@ -96,6 +101,7 @@ export async function executeConsult(
 	if (!env.counter.take(analysis.turnKey, max)) return result(`consult limit reached for this turn (${max}).`);
 
 	const question = params.question?.trim() || undefined;
+	const effort = (EFFORT_LEVELS as readonly string[]).includes(params.effort ?? "") ? params.effort : undefined;
 	try {
 		onUpdate?.(result("Consulting advisors…"));
 	} catch {
@@ -104,16 +110,17 @@ export async function executeConsult(
 	const messages = env.caller ? [...env.snapshot, env.caller] : env.snapshot;
 	let round: RoundOutput | undefined;
 	try {
-		round = await env.run({ messages, question, turn: analysis.turnKey, step: analysis.step });
+		round = await env.run({ messages, question, effort, turn: analysis.turnKey, step: analysis.step });
 	} catch (error) {
 		return result(`consult failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 200), undefined, { isError: true });
 	}
 	if (!round) return result("consult failed: the preset has no usable advisors.", undefined, { isError: true });
 
-	const usage = round.results.reduce<ConsultResult["usage"]>((sum, r) => addUsage(sum, r.usage), undefined);
+	const calls = round.synthesis ? [...round.results, round.synthesis] : round.results;
+	const usage = calls.reduce<ConsultResult["usage"]>((sum, r) => addUsage(sum, r.usage), undefined);
 	const extra = usage ? { usage } : {};
 	if (round.interrupted) return result("consult aborted.", round.record, { ...extra, isError: true });
-	const advice = frameAdvice(round.results);
+	const advice = frameAdvice(round.results, undefined, round.synthesis);
 	if (!advice) {
 		const reasons = [...new Set(round.results.map((r) => (r.error ?? "empty response").slice(0, 80)))].join("; ");
 		return result(`consult failed: no advisor answered (${reasons}).`, round.record, { ...extra, isError: true });

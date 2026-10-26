@@ -4,7 +4,8 @@ Mixture of Models for the [pi](https://pi.dev) coding agent. Before your model (
 1–3 advisor models look at the conversation and give advice that the actor sees for that one request only.
 The design is in [PLAN.md](PLAN.md).
 
-**Status: all planned steps built.** MoA is active via `/moa on` (session toggle), a one-shot
+**Status: all planned steps built**, plus effort levels, verdicts, an optional synthesis slot and
+a before-done review (step 10). MoA is active via `/moa on` (session toggle), a one-shot
 `/moa <prompt>`, or by selecting a `moa/<preset>` virtual model (optional). While active, the
 preset's advisors run when one of its triggers fires; their advice is added to that request only,
 and each fresh round is saved as a `moa` session entry with its trigger.
@@ -14,8 +15,8 @@ and each fresh round is saved as a `moa` session entry with its trigger.
   system prompt, tools, transcript and same-model thinking, projected as pi projects it (a prompt
   forced by a `before_agent_start` handler, hidden tool declarations, `images.blockImages`) —
   plus one trailing user message with the advisor's instructions. It uses the actor's thinking
-  level unless the advisor sets `thinking`, and the actor's session id, so it can reuse the actor's
-  prompt cache. `context.nativeToolChoice` (default `"omit"`) sends no tool choice, which keeps
+  level unless the advisor sets `thinking` or its own `effort` (see Effort), and the actor's
+  session id, so it can reuse the actor's prompt cache. `context.nativeToolChoice` (default `"omit"`) sends no tool choice, which keeps
   the request cache-compatible with the actor's; only the reply's text is used, and a tool-call reply with
   no text is retried once with tool choice `none` (recorded as `retried`). `"none"` always sends
   `none` (on Anthropic this stops it reading the actor's cached messages). Bedrock never gets
@@ -29,11 +30,12 @@ and each fresh round is saved as a `moa` session entry with its trigger.
   (AGENTS.md etc., from `before_agent_start`) under "# Project instructions", capped at 8000
   characters head and tail. The transcript is plain text: tool calls as `⟨tool name(args)⟩`, tool
   results cut to `toolResultChars` as their own user turns, thinking dropped, images as `[image]`.
-  Text advisors use their own thinking setting (none when unset) and a per-slot session id.
+  Text advisors think at the round's effort level unless `thinking` is set (`"off"` for none) and
+  use a per-slot session id.
 - **Trimming** (text view, when the advisor model's `contextWindow` is known): the view is kept
   under `contextWindow × 0.9 − reserve` tokens, estimated at 3 characters per token; the reserve
-  is `maxTokens` (8192 when unset) plus the thinking budget for the advisor's `thinking` level,
-  capped at half the window. Over that, the oldest messages are replaced by
+  is the advisor's output cap (`maxTokens`, else the effort level's) plus the thinking budget for
+  its thinking level, capped at half the window. Over that, the oldest messages are replaced by
   `[… N earlier messages omitted …]`; the last two steps, the last message and the `pin` items
   stay (`task`: the turn's user message; `latestError`: the latest failed tool result and its
   call; `latestDiff`: the latest file-changing call — edit/write-style tool names, or a path plus
@@ -50,7 +52,8 @@ and each fresh round is saved as a `moa` session entry with its trigger.
 - `{ "every_n": N }`: the first request of the turn and every Nth step after it;
 - `on_failure`: a streak of `onFailure.consecutiveErrors` failed tool results in a row, or of the
   same tool call (name and arguments) `onFailure.repeatedCalls` times in a row, within the turn —
-  when a streak first reaches N, and again at every further N.
+  when a streak first reaches N, and again at every further N;
+- `before_done`: when a reply ends the turn, advisors review the work (see Before-done review).
 
 On steps where nothing fires, the turn's latest advice is reused, with a note that it predates the
 newest tool results; with no advice yet this turn, the request goes out without any. A retried
@@ -60,8 +63,63 @@ compaction summarises away the turn's user message mid-turn, the turn's advice i
 marked stale; `on_failure` and `every_step` keep working, and `every_n` counts steps from the
 summary.
 
+**Effort** (`effort`, default `"medium"`; per preset, or per advisor slot): how hard advisors work.
+A level is a bundle: the thinking level pi sends (mapped to the provider's effort or thinking
+budget and clamped to what the model supports), the output cap, and the length guidance in the
+advisor prompt. The flat "about 400 words" rule is gone; each level has its own line.
+
+| effort | thinking | maxTokens | length guidance |
+|---|---|---|---|
+| `low` | low | 1024 | about 120 words: the single best next step, at most two risks |
+| `medium` | medium | 2048 | about 300 words unless the problem truly needs more |
+| `high` | high | 4096 | about 600 words; say what to verify and how |
+| `max` | max | 8192 | no limit, but a three-to-five-line summary first |
+
+A slot's explicit `thinking` or `maxTokens` overrides the level's value. `on_failure`,
+`before_done` and `consult` rounds run one level above the base (the problem is harder by then);
+`user_turn`, `every_step` and `every_n` rounds run at the base. The actor's `consult` call can
+pass `effort` to request a level outright. Nothing ever exceeds the preset's `maxEffort` (default
+`"max"`). Native-view advisors share the actor's prompt cache, which a different thinking level
+would invalidate on some providers, so for them the level only sets the output cap and length
+line and thinking stays the actor's, unless the slot sets its own `effort` or `thinking`. The
+level each advisor ran at is recorded and shown on its card line. Length guidance is about 80% of
+what the cap allows, so a reply rarely hits it; one that does is marked (see Cleaning).
+
+**Verdicts:** every advisor is asked to open with one line, `Verdict: on-track` (carry on),
+`Verdict: revise` (change something first; it says what) or `Verdict: blocked` (only the user can
+move it forward). The line stays in the advice the actor sees, is parsed into the record (shown on
+the round card, most severe first, e.g. `revise ×2, on-track`), and decides the before-done review.
+A missing or unrecognised line is simply no verdict.
+
+**Synthesis** (`synthesis`, optional per preset: `{ "model", "thinking", "maxTokens", "prompt" }`):
+with two or more advisors, their advice is unreconciled, so the framing says so and tells the actor
+to decide from the transcript where they disagree. A synthesis slot adds one call after the round
+(text view of the transcript plus the advisors' advice, with `maxTokens` 1024 by default and no
+thinking unless set) whose only job is to reconcile real disagreements. It replies exactly
+`No reconciliation needed.` when the advisors agree or differ only in emphasis, and that reply is
+dropped: the actor sees nothing from it. Otherwise it opens with its own verdict and, in about 150
+words, names each disagreement, says which side the transcript supports, and gives one
+recommendation; that is appended as a `Synthesis:` block after the advisors, with a note replacing
+the unreconciled one. It never runs with one advisor or when fewer than two answered, its cost
+counts toward the budget, and a failed synthesis leaves the advisors' advice as it was.
+
+**Before-done review** (`"before_done"` in `triggers`; off by default): when the actor's reply
+ends the turn (no tool calls, i.e. it considers the task done or is handing back to the user), the
+preset's advisors review the work at `turn_end`, asked whether anything is incomplete, unverified,
+wrong or left out, one effort level above the base. The round is recorded like any other
+(reason `before_done`). On a combined verdict of `revise` (any advisor, or the synthesis when it
+spoke with a verdict) the framed advice is appended as a `moa-review` message, with a preamble
+saying the turn would have ended and the actor should continue on the points that hold up or say
+why it disagrees, and pi runs one more model request; this is the one case besides `consult` where
+advice stays in the conversation. On `on-track` or `blocked` the turn ends. At most one review per
+turn, never after an aborted or failed reply, under a `pause`d or `stop`ped budget, or for a
+reply that calls tools. Text views later show the delivered review as
+`[MoA before-done review: advice omitted]`, as they do consult results; native views keep it. The
+turn's cached advice is dropped once a review is delivered, so the continuation carries the review
+alone. In the transcript the message shows as one line; the advice is on the round's card.
+
 **The `consult` tool:** while MoA is on and the preset has `consult.enabled` (and `maxPerTurn` > 0),
-the actor gets a `consult` tool with an optional `question`. It runs the preset's advisors (same
+the actor gets a `consult` tool with an optional `question` and an optional `effort` (see Effort). It runs the preset's advisors (same
 views, roles, trimming and timeouts as a round) on the actor's latest request plus the response
 that made the call, with "The acting agent asks: …" added to the advice request, and returns the
 framed advice as the tool result. Unlike per-request advice, this result stays in the
@@ -95,13 +153,16 @@ code samples survive verbatim. Outside fences, these become `[removed tool-call-
   only a `name`/`tool` string plus object-valued `arguments`/`input`/`args`/`parameters` (and ids).
   `parameters` holding a JSON Schema (a tool definition) does not count.
 
-A line starting with `[MoA reference context` becomes `[removed framing-like text]`. The trade-off
+A line starting with `[MoA reference context` becomes `[removed framing-like text]`. A reply that
+stopped at its output cap (the provider's length stop) gets
+`[advice cut off at the advisor's output limit; the ending is missing]` appended and the record
+flag `capped`, so the actor never takes a cut-off sentence for the whole advice. The trade-off
 favours keeping text: JSON containers that merely include a call (API responses, `tool_calls`
 messages, JSON-RPC `tools/call` requests, arrays of calls), tool definitions, objects whose input
 is not an object (`{"name": "build", "input": "x"}`), mid-line tag or token mentions, and anything
 fenced are kept, so an advisor can still show call syntax in those forms. Each advisor's text is
 then capped at 12,000 characters (head and tail). The record marks advisors whose text was changed
-(`sanitized`) or cut (`truncated`).
+(`sanitized`) or cut (`truncated`); the verdict line is read after cleaning.
 
 **Budget** (`budget`, default `{ "sessionUsd": 5, "onExceed": "warn" }`): advisor spend is the sum
 of the advisors' reported cost (`usage.cost.total`) over the `moa` round records and `consult`
@@ -125,11 +186,14 @@ ends the provider request in pi; its aborted reply (which carries the usage repo
 awaited for up to a second so that usage is recorded.
 
 **Display:** each round's `moa` entry shows as one line in the transcript, e.g.
-`◇ MoA · user_turn · step 2 · 2/2 advisors · $0.0120 · 4.1s` (the advisor count turns warning/error
-coloured when advisors fail, `cost ?`/`+?` for unreported cost, `interrupted` for aborted rounds). Expanding tool output (pi's
-expand toggle, e.g. Ctrl+O) shows each advisor's label (anonymised as recorded), model, role, tokens
-in/out (with cached input), cost, latency, flags (`retried`, `sanitized`, `truncated`) or error, and
-its advice as markdown (code blocks highlighted as in pi's own messages). `consult` calls show as `consult "question…"` with the same card as the
+`◇ MoA · user_turn · step 2 · 2/2 advisors · revise, on-track · $0.0120 · 4.1s` (the advisor count
+turns warning/error coloured when advisors fail, the verdicts are coloured by the most severe,
+`synthesis` / `synthesis: nothing to reconcile` / `synthesis failed` when the preset has one,
+`cost ?`/`+?` for unreported cost, `interrupted` for aborted rounds). Expanding tool output (pi's
+expand toggle, e.g. Ctrl+O) shows each advisor's label (anonymised as recorded), model, role, effort
+level, verdict, tokens in/out (with cached input), cost, latency, flags (`retried`, `sanitized`,
+`truncated`, `capped`) or error, and its advice as markdown (code blocks highlighted as in pi's own
+messages), then the synthesis the same way. `consult` calls show as `consult "question…"` with the same card as the
 result (the actor still gets the plain framed advice); calls that ran no round (limit, budget,
 unavailable) show their result text. `ui.advice`: `"collapsed"` (default; follows the expand
 toggle), `"expanded"` (always), `"hidden"` (no round entries; consult results show the card line
@@ -201,7 +265,7 @@ pi install ./path/to/pi-moa      # or: pi -e ./path/to/pi-moa for one run
 
 | Command | Effect |
 |---|---|
-| `/moa` | Status: on/off, preset, triggers, advisors, advisor spend, config files |
+| `/moa` | Status: on/off, preset, triggers, advisors, effort, synthesis, advisor spend, config files |
 | `/moa on [preset]` | Turn MoA on for this session (default preset if omitted). Validates the preset and its models first. |
 | `/moa off` | Turn it off |
 | `/moa reload` | Re-read config files; turns MoA off with a warning if the active preset is no longer usable |

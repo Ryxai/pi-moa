@@ -32,6 +32,7 @@ interface Harness {
 	/** Registered tools by name, the active set, and every `setActiveTools` call. */
 	tools: { registered: Map<string, ToolDefinition>; active: string[]; sets: string[][] };
 	entryRenderers: Map<string, EntryRenderer>;
+	messageRenderers: Map<string, unknown>;
 	/** Registered virtual models by id (all under provider `moa`), and every registration call. */
 	virtual: Map<string, ExtensionVirtualModel<unknown>>;
 	registrations: string[];
@@ -76,6 +77,7 @@ async function setup(globalConfig?: unknown): Promise<Harness> {
 	const piState = { blockImages: false, thinking: "medium" };
 	let command: { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> } | undefined;
 	const entryRenderers = new Map<string, EntryRenderer>();
+	const messageRenderers = new Map<string, unknown>();
 	const tools = { registered: new Map<string, ToolDefinition>(), active: ["read", "bash", "edit", "write"], sets: [] as string[][] };
 	const pi = {
 		registerTool: (tool: ToolDefinition) => {
@@ -95,6 +97,7 @@ async function setup(globalConfig?: unknown): Promise<Harness> {
 		getSettings: () => ({ images: { blockImages: piState.blockImages }, thinkingBudgets: { low: 3000 } }),
 		getThinkingLevel: () => piState.thinking,
 		registerEntryRenderer: (customType: string, renderer: EntryRenderer) => entryRenderers.set(customType, renderer),
+		registerMessageRenderer: (customType: string, renderer: unknown) => messageRenderers.set(customType, renderer),
 		registerVirtualModel: (definition: ExtensionVirtualModel<unknown>) => {
 			registrations.push(definition.id);
 			virtual.set(definition.id, definition);
@@ -148,6 +151,7 @@ async function setup(globalConfig?: unknown): Promise<Harness> {
 		piState,
 		tools,
 		entryRenderers,
+		messageRenderers,
 		virtual,
 		registrations,
 		sent,
@@ -1392,5 +1396,102 @@ describe("/moa <prompt> one-shot", () => {
 		await h.run("fix the bug");
 		expect(h.lastNote()?.message).toBe("MoA already on (preset council): prompt sent");
 		expect(h.sel.model).toEqual(virtualModel("council"));
+	});
+});
+
+describe("before_done review", () => {
+	const records = () => h.entries.filter((e) => e.customType === RECORD_ENTRY).map((e) => e.data as MoaRecord);
+	const call = { type: "toolCall" as const, id: "c1", name: "bash", arguments: { command: "npm test" } };
+	const transcript = (final: AgentMessage, prompt = "Fix the test", ts = 100) => [system("You are pi."), user(prompt, ts), assistant([call], { stopReason: "toolUse" }), toolResult("bash", "ok"), final];
+	const done = (t = "Done.") => assistant([text(t)]);
+	const turnEnd = (messages: AgentMessage[], extra: Record<string, unknown> = {}) =>
+		h.emit("turn_end", { type: "turn_end", outcome: "completed", message: messages.at(-1), toolResults: [], context: { contextMessages: messages, canContinue: false }, ...extra });
+	const usePreset = async (preset: Record<string, unknown>) => {
+		await writeGlobal(h, { presets: { solo: preset } });
+		await h.run("reload");
+		await h.run("on");
+	};
+	type Boundary = { entries: { type: string; customType: string; content: string; display: boolean; details: unknown }[]; continue: boolean } | undefined;
+	beforeEach(() => {
+		h.llm.reply = async () => assistant([text("Verdict: revise\nThe tests were not run after the edit.")], { usage: usage(0.02) });
+	});
+
+	it("runs a review when a reply ends the turn and sends the actor back to work on revise", async () => {
+		await usePreset({ triggers: ["user_turn", "before_done"] });
+		const messages = transcript(done());
+		const out = (await turnEnd(messages)) as Boundary;
+		expect(out?.continue).toBe(true);
+		expect(out?.entries).toHaveLength(1);
+		const entry = out!.entries[0]!;
+		expect(entry).toMatchObject({ type: "custom_message", customType: "moa-review", display: true });
+		expect(entry.content).toContain("[MoA before-done review]");
+		expect(entry.content).toContain("Advisor A (advisor):\nVerdict: revise\nThe tests were not run after the edit.");
+		expect(records().map((r) => [r.reason, r.step, r.advisors[0]?.verdict, r.advisors[0]?.effort])).toEqual([["before_done", 2, "revise", "high"]]);
+		expect(entry.details).toEqual(records()[0]);
+		// The advisors were asked to review a finished turn, at one effort level above the preset's.
+		const request = (h.llm.contexts.at(-1)!.messages.at(-1)!.content as { text: string }[])[0]!.text;
+		expect(request).toContain("The agent's last reply ends its turn");
+		expect(h.llm.options.at(-1)).toMatchObject({ maxTokens: 4096 });
+		expect(h.status.get("moa")).toBe("moa:solo · $0.0200");
+		expect(h.messageRenderers.has("moa-review")).toBe(true);
+	});
+
+	it("lets the turn end on on-track or blocked, still recording the round", async () => {
+		await usePreset({ triggers: ["before_done"] });
+		for (const verdict of ["on-track", "blocked"]) {
+			h.llm.reply = async () => assistant([text(`Verdict: ${verdict}\nFine.`)]);
+			expect(await turnEnd(transcript(done(), "Fix", 100 + verdict.length))).toBeUndefined();
+		}
+		expect(records().map((r) => r.advisors[0]?.verdict)).toEqual(["on-track", "blocked"]);
+	});
+
+	it("reviews at most once per turn, and not when the reply calls tools, failed, or MoA is off", async () => {
+		await usePreset({ triggers: ["before_done"] });
+		const messages = transcript(done());
+		expect(((await turnEnd(messages)) as Boundary)?.continue).toBe(true);
+		expect(await turnEnd([...messages, assistant([text("Still done.")])])).toBeUndefined();
+		expect(await turnEnd(transcript(assistant([call], { stopReason: "toolUse" }), "Fix", 101))).toBeUndefined();
+		expect(await turnEnd(transcript(done(), "Fix", 102), { outcome: "aborted" })).toBeUndefined();
+		await h.run("off");
+		expect(await turnEnd(transcript(done(), "Fix", 103))).toBeUndefined();
+		expect(records()).toHaveLength(1);
+	});
+
+	it("does nothing without the trigger", async () => {
+		await h.run("on");
+		expect(await turnEnd(transcript(done()))).toBeUndefined();
+		expect(records()).toHaveLength(0);
+	});
+
+	it("drops the turn's cached advice so the next request carries only the review", async () => {
+		await usePreset({ triggers: ["user_turn", "before_done"] });
+		const messages = transcript(done());
+		const step = (m: unknown[]) => h.emit("context_with_system", { type: "context_with_system", messages: m });
+		await step(messages.slice(0, 2));
+		expect(records().map((r) => r.reason)).toEqual(["user_turn"]);
+		const out = (await turnEnd(messages)) as Boundary;
+		const review = { role: "custom", customType: "moa-review", content: out!.entries[0]!.content, display: true, timestamp: 200 };
+		expect(await step([...messages, review])).toBeUndefined();
+	});
+
+	it("is paused by the advisor budget", async () => {
+		await writeGlobal(h, { budget: { sessionUsd: 0.01, onExceed: "pause" }, presets: { solo: { triggers: ["before_done"] } } });
+		await h.run("reload");
+		await h.run("on");
+		h.entries.push({ type: "custom", customType: RECORD_ENTRY, data: { preset: "solo", reason: "user_turn", turn: "t", step: 0, advisors: [{ label: "A", ok: true, costUsd: 0.02 }] } });
+		await h.emit("session_start");
+		await h.run("on");
+		expect(await turnEnd(transcript(done()))).toBeUndefined();
+		expect(records().map((r) => r.reason)).toEqual(["user_turn"]);
+	});
+
+	it("consult passes the actor's effort through to the round", async () => {
+		await h.run("on");
+		await h.emit("context_with_system", { type: "context_with_system", messages: [system("You are pi."), user("Fix", 100)] });
+		const out = await h.tools.registered.get("consult")!.execute("t1", { effort: "low" }, undefined, undefined, h.ctx as never);
+		expect((out.details as MoaRecord).advisors[0]?.effort).toBe("low");
+		expect(h.llm.options.at(-1)).toMatchObject({ maxTokens: 1024 });
+		expect(await h.run("")).toBeUndefined();
+		expect(h.lastNote()?.message).toContain("effort: medium (max max)");
 	});
 });

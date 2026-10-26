@@ -1,4 +1,5 @@
-import type { AdvisorConfig, PresetConfig } from "./schema.ts";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import type { AdvisorConfig, PresetConfig, SynthesisConfig } from "./schema.ts";
 
 export interface ModelLike {
 	provider: string;
@@ -6,6 +7,8 @@ export interface ModelLike {
 	/** pi's `Model` fields that advisor calls use when present. */
 	api?: string;
 	contextWindow?: number;
+	reasoning?: boolean;
+	thinkingLevelMap?: Model<Api>["thinkingLevelMap"];
 }
 
 /** The slice of pi's ModelRegistry that resolution needs. */
@@ -22,6 +25,7 @@ export interface ResolvedAdvisor<M extends ModelLike> {
 export interface ResolvedPreset<M extends ModelLike> {
 	actor: M;
 	advisors: ResolvedAdvisor<M>[];
+	synthesis?: { config: SynthesisConfig; model: M };
 }
 
 export type ResolveResult<M extends ModelLike> =
@@ -49,8 +53,9 @@ export function resolvePreset<M extends ModelLike>(
 		const model = resolve(config.model, `advisor ${i + 1}`);
 		if (model) advisors.push({ config, model });
 	});
+	const synthesisModel = preset.synthesis ? resolve(preset.synthesis.model, "synthesis") : undefined;
 	if (errors.length > 0 || !actor) return { ok: false, errors };
-	return { ok: true, preset: { actor, advisors } };
+	return { ok: true, preset: { actor, advisors, ...(preset.synthesis && synthesisModel && { synthesis: { config: preset.synthesis, model: synthesisModel } }) } };
 }
 
 /** Returns the model, or a human-readable reason it can't be used. */

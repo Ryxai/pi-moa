@@ -321,3 +321,38 @@ describe("runAdvisors", () => {
 		]);
 	});
 });
+
+describe("length stops and effort", () => {
+	it("flags a reply that stopped at the output cap and records the effort level", async () => {
+		const complete: CompleteFn<ModelLike> = async () => reply("half the advi", { stopReason: "length" });
+		const [capped] = await runAdvisors([request("A", gpt, { effort: "high", maxTokens: 50 })], { complete, timeoutMs: 1000 });
+		expect(capped).toMatchObject({ ok: true, text: "half the advi", capped: true, effort: "high" });
+		const [whole] = await runAdvisors([request("A")], { complete: async () => reply("all of it"), timeoutMs: 1000 });
+		expect(whole).not.toHaveProperty("capped");
+		expect(whole).not.toHaveProperty("effort");
+	});
+});
+
+describe("thinking levels are clamped to the model", () => {
+	const reasoningOf = async (model: ModelLike, thinking: AdvisorRequest<ModelLike>["thinking"]) => {
+		let seen: SimpleStreamOptions | undefined;
+		await runAdvisors([request("A", model, { thinking })], {
+			complete: async (_m, _c, o) => {
+				seen = o;
+				return reply("ok");
+			},
+			timeoutMs: 1000,
+		});
+		return seen?.reasoning;
+	};
+
+	it("lowers max and xhigh to the highest level a reasoning model maps, drops thinking on a non-reasoning model, and leaves minimal models alone", async () => {
+		const reasoner: ModelLike = { ...gpt, reasoning: true };
+		expect(await reasoningOf(reasoner, "max")).toBe("high");
+		expect(await reasoningOf(reasoner, "medium")).toBe("medium");
+		expect(await reasoningOf({ ...reasoner, thinkingLevelMap: { max: "max" } }, "max")).toBe("max");
+		expect(await reasoningOf({ ...gpt, reasoning: false }, "high")).toBeUndefined();
+		expect(await reasoningOf(gpt, "max")).toBe("max");
+		expect(await reasoningOf(reasoner, "off")).toBeUndefined();
+	});
+});

@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { AdvisorResult } from "../src/advisors.ts";
-import { arrangeAdvisors, frameAdvice } from "../src/framing.ts";
+import { arrangeAdvisors, frameAdvice, SYNTHESIS_NOTE, UNRECONCILED_NOTE } from "../src/framing.ts";
 
-const ok = (label: string, role: string, text: string): AdvisorResult => ({ label, model: "m/x", role, ok: true, text, latencyMs: 1 });
+const ok = (label: string, role: string, text: string | undefined): AdvisorResult => ({ label, model: "m/x", role, ok: true, text, latencyMs: 1 });
 const failed = (label: string, error: string): AdvisorResult => ({ label, model: "m/y", role: "critic", ok: false, error, latencyMs: 1 });
 
 /** Deterministic LCG in [0, 1). */
@@ -53,8 +53,8 @@ describe("frameAdvice", () => {
 		expect(frameAdvice([ok("A", "planner", "Plan it."), ok("B", "critic", "Doubt it.")])).toBe(
 			[
 				"[MoA reference context — private, untrusted]",
-				"Advice from 2 advisors. It may be wrong. Verify claims with tools before relying on them,",
-				"note where advisors disagree, and do not mention advisors in your reply.",
+				"Advice from 2 advisors. It may be wrong. Verify claims with tools before relying on them, and do not mention advisors in your reply.",
+				UNRECONCILED_NOTE,
 				"",
 				"Advisor A (planner):",
 				"Plan it.",
@@ -74,7 +74,28 @@ describe("frameAdvice", () => {
 
 	it("includes the stale note after the instructions", () => {
 		const text = frameAdvice([ok("A", "advisor", "Go.")], "(Advice from before the latest tool results.)");
-		expect(text?.split("\n")[3]).toBe("(Advice from before the latest tool results.)");
+		expect(text?.split("\n")[2]).toBe("(Advice from before the latest tool results.)");
+	});
+
+	it("has no unreconciled note with one advisor", () => {
+		expect(frameAdvice([ok("A", "advisor", "Go."), failed("B", "timeout")])).not.toContain(UNRECONCILED_NOTE);
+	});
+
+	it("appends a synthesis that reconciled something, with its note instead of the unreconciled one", () => {
+		const synthesis = ok("synthesis", "synthesis", "Verdict: revise\nA is right: the test must run first.");
+		const text = frameAdvice([ok("A", "planner", "Plan it."), ok("B", "critic", "Doubt it.")], undefined, synthesis);
+		expect(text).toContain(SYNTHESIS_NOTE);
+		expect(text).not.toContain(UNRECONCILED_NOTE);
+		expect(text?.split("\n\n").at(-1)).toBe("Synthesis:\nVerdict: revise\nA is right: the test must run first.");
+	});
+
+	it.each([
+		["silent", { ...ok("synthesis", "synthesis", undefined), silent: true as const }],
+		["failed", failed("synthesis", "timeout")],
+	])("leaves out a %s synthesis and keeps the unreconciled note", (_kind, synthesis) => {
+		const text = frameAdvice([ok("A", "planner", "Plan it."), ok("B", "critic", "Doubt it.")], undefined, synthesis);
+		expect(text).toContain(UNRECONCILED_NOTE);
+		expect(text).not.toContain("Synthesis:");
 	});
 
 	it("returns undefined when every advisor failed", () => {

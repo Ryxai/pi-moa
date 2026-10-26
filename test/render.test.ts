@@ -12,6 +12,7 @@ import {
 	recordComponent,
 	renderConsultResult,
 	renderEntry,
+	reviewMessageText,
 	statusLine,
 	type ThemeLike,
 } from "../src/render.ts";
@@ -161,5 +162,39 @@ describe("statusLine", () => {
 		expect(statusLine("solo", { usd: 1.5, unknown: 0 }, budget)).toBe("moa:solo · $1.50 · budget reached");
 		expect(statusLine("solo", { usd: 1.5, unknown: 0 }, { sessionUsd: 0, onExceed: "warn" })).toBe("moa:solo · $1.50");
 		expect(statusLine("solo", { usd: 1.5, unknown: 0 }, undefined)).toBe("moa:solo · $1.50");
+	});
+});
+
+describe("verdicts, effort, capped replies and synthesis", () => {
+	it("cardLine shows the verdicts, most severe first, and the synthesis state", () => {
+		const r = record([ok("A", { verdict: "on-track" }), ok("B", { verdict: "revise" }), ok("C", { verdict: "revise" })]);
+		expect(cardLine(r, plain)).toContain("3/3 advisors · revise ×2, on-track");
+		expect(cardLine(r, theme)).toContain("<warning>revise ×2, on-track</warning>");
+		expect(cardLine(record([ok("A", { verdict: "blocked" })]), theme)).toContain("<error>blocked</error>");
+		expect(cardLine(record([ok("A")]), plain)).not.toContain("on-track");
+		const silent = { ...ok("synthesis", { silent: true, text: undefined, latencyMs: 9000 }), role: "synthesis" };
+		expect(cardLine(record([ok("A"), ok("B")], { synthesis: silent }), plain)).toContain("synthesis: nothing to reconcile");
+		expect(cardLine(record([ok("A"), ok("B")], { synthesis: silent }), plain)).toContain("9.0s");
+		expect(cardLine(record([ok("A"), ok("B")], { synthesis: { ...ok("synthesis", { verdict: "revise" }), role: "synthesis" } }), plain)).toContain("· synthesis ·");
+		expect(cardLine(record([ok("A"), ok("B")], { synthesis: failed("synthesis") }), theme)).toContain("<warning>synthesis failed</warning>");
+	});
+
+	it("advisorLine shows effort, verdict and the capped flag", () => {
+		const line = advisorLine(ok("Advisor A", { effort: "high", verdict: "revise", capped: true }), theme);
+		expect(line).toContain("<muted>effort high</muted>");
+		expect(line).toContain("<warning>revise</warning>");
+		expect(line).toContain("<warning>capped</warning>");
+		expect(advisorLine({ ...ok("synthesis", { silent: true, text: undefined }), role: "synthesis" }, plain)).toContain("nothing to reconcile");
+	});
+
+	it("recordComponent lists the synthesis after the advisors when expanded", () => {
+		const synthesis = { ...ok("synthesis", { text: "Reconciled: do A." }), role: "synthesis" };
+		const out = lines(recordComponent(record([ok("A"), ok("B")], { synthesis }), true, plain)).join("\n");
+		expect(out.indexOf("synthesis · openai/gpt")).toBeGreaterThan(out.indexOf("B · openai/gpt"));
+		expect(out).toContain("Reconciled: do A.");
+	});
+
+	it("reviewMessageText is a one-line note", () => {
+		expect(reviewMessageText(plain)).toBe("◇ MoA · before_done review sent to the agent; it continues working (see the round above)");
 	});
 });

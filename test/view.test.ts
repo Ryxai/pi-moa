@@ -306,3 +306,16 @@ describe("renderEntries", () => {
 		expect(entries[2]).toMatchObject({ toolCallId: "c1", isError: true });
 	});
 });
+
+describe("delivered before_done reviews", () => {
+	it("are shown to text-view advisors as omitted advice", () => {
+		const review = { role: "custom" as const, customType: "moa-review", content: "[MoA before-done review] secret advice", display: true, timestamp: 5 };
+		const other = { role: "custom" as const, customType: "other-ext", content: "a note", display: true, timestamp: 6 };
+		const turns = renderTranscript([user("Fix", 1), assistant([text("Done.")]), review, other], 4000);
+		const last = turns.at(-1)!;
+		expect(last.role).toBe("user");
+		expect(last.blocks.join("")).toContain("[MoA before-done review: advice omitted]");
+		expect(last.blocks.join("")).toContain("a note");
+		expect(JSON.stringify(turns)).not.toContain("secret advice");
+	});
+});

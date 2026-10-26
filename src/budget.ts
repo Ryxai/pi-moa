@@ -22,11 +22,11 @@ export function budgetAction(budget: MoaConfig["budget"], spent: number): Budget
 	return budget.sessionUsd > 0 && spent >= budget.sessionUsd ? budget.onExceed : "run";
 }
 
-/** Spend of one round record (a `moa` entry's data or a consult result's `details`). */
+/** Spend of one round record (a `moa` entry's data or a consult result's `details`), synthesis included. */
 export function recordSpend(record: unknown): Spend {
 	const spend: Spend = { usd: 0, unknown: 0 };
 	if (!isPlainObject(record) || !Array.isArray(record.advisors)) return spend;
-	for (const advisor of record.advisors) {
+	for (const advisor of [...record.advisors, record.synthesis]) {
 		if (!isPlainObject(advisor)) continue;
 		const cost = advisor.costUsd;
 		if (typeof cost === "number" && Number.isFinite(cost)) spend.usd += cost;
